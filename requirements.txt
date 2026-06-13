@@ -1,0 +1,8 @@
+# Pflicht
+Pillow>=10.0
+
+# Optional: Hintergrund entfernen (KI)
+# rembg>=2.0
+
+# Optional: SVG Import
+# cairosvg>=2.7
