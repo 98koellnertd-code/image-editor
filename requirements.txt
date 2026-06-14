@@ -1,8 +1,15 @@
 # Pflicht
 Pillow>=10.0
 
+# Empfohlen: Zauberstab (Farbauswahl)
+numpy>=1.24
+scipy>=1.10            # zusammenhängende Auswahl (sonst numpy-Fallback)
+
+# Optional: SVG öffnen (eigenständige Windows-Wheels, keine native DLL nötig)
+pymupdf>=1.24
+
+# Optional: PSD mit Ebenen öffnen
+psd-tools>=1.9
+
 # Optional: Hintergrund entfernen (KI)
 # rembg>=2.0
-
-# Optional: SVG Import
-# cairosvg>=2.7

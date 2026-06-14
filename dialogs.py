@@ -44,7 +44,7 @@ class _Base(tk.Toplevel):
                   bg=BTN, fg=TEXT, bd=0, padx=10, pady=4,
                   relief=tk.FLAT, font=('Segoe UI', 9)).pack(side=tk.RIGHT, padx=4)
         tk.Button(f, text='OK', command=self._ok,
-                  bg=ACCENT, fg='#000', bd=0, padx=16, pady=4,
+                  bg=ACCENT, fg='#ffffff', bd=0, padx=16, pady=4,
                   relief=tk.FLAT, font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=4)
 
     def _lbl(self, p, text, dim=False):
@@ -75,12 +75,15 @@ class _Base(tk.Toplevel):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class NewImageDialog(_Base):
+    def __init__(self, parent):
+        super().__init__(parent, 'Neues Bild')
+
     def _build(self):
         f = tk.Frame(self, bg=PANEL, padx=20, pady=14); f.pack()
-        self._w = tk.IntVar(value=1920)
-        self._h = tk.IntVar(value=1080)
+        self._vw = tk.IntVar(value=1920)
+        self._vh = tk.IntVar(value=1080)
 
-        for lbl, var in [('Breite (px):', self._w), ('Höhe (px):', self._h)]:
+        for lbl, var in [('Breite (px):', self._vw), ('Höhe (px):', self._vh)]:
             row = tk.Frame(f, bg=PANEL); row.pack(fill=tk.X, pady=3)
             self._lbl(row, lbl).pack(side=tk.LEFT, padx=(0, 6))
             self._entry(row, var).pack(side=tk.LEFT)
@@ -92,7 +95,7 @@ class NewImageDialog(_Base):
         scroll.pack(fill=tk.X)
         for name, w, h in SOCIAL_PRESETS:
             tk.Button(scroll, text=f'{name}  ({w}×{h})',
-                      command=lambda _w=w, _h=h: (self._w.set(_w), self._h.set(_h)),
+                      command=lambda _w=w, _h=h: (self._vw.set(_w), self._vh.set(_h)),
                       bg=BTN, fg=TEXT, bd=0, padx=8, pady=3, anchor='w',
                       font=('Segoe UI', 8), relief=tk.FLAT,
                       cursor='hand2').pack(fill=tk.X, pady=1)
@@ -100,8 +103,8 @@ class NewImageDialog(_Base):
 
     def _ok(self):
         try:
-            w = max(1, min(self._w.get(), 16000))
-            h = max(1, min(self._h.get(), 16000))
+            w = max(1, min(self._vw.get(), 16000))
+            h = max(1, min(self._vh.get(), 16000))
             self.result = (w, h, (255, 255, 255, 0))
         except Exception:
             pass
@@ -121,14 +124,14 @@ class ResizeDialog(_Base):
         f = tk.Frame(self, bg=PANEL, padx=20, pady=14); f.pack()
         self._lbl(f, f'Aktuell: {self._ow} × {self._oh} px', dim=True).pack(anchor='w', pady=(0, 8))
 
-        self._w      = tk.IntVar(value=self._ow)
-        self._h      = tk.IntVar(value=self._oh)
+        self._vw      = tk.IntVar(value=self._ow)
+        self._vh      = tk.IntVar(value=self._oh)
         self._lock   = tk.BooleanVar(value=True)
         self._method = tk.StringVar(value='Lanczos')
         self._pct    = tk.IntVar(value=100)
         self._updating = [False]
 
-        for lbl, var in [('Breite (px):', self._w), ('Höhe (px):', self._h)]:
+        for lbl, var in [('Breite (px):', self._vw), ('Höhe (px):', self._vh)]:
             row = tk.Frame(f, bg=PANEL); row.pack(fill=tk.X, pady=3)
             self._lbl(row, lbl).pack(side=tk.LEFT, padx=(0, 6))
             self._entry(row, var).pack(side=tk.LEFT)
@@ -140,7 +143,7 @@ class ResizeDialog(_Base):
             if self._updating[0] or not self._lock.get(): return
             try:
                 self._updating[0] = True
-                self._h.set(round(self._w.get() * self._oh / self._ow))
+                self._vh.set(round(self._vw.get() * self._oh / self._ow))
             except Exception: pass
             finally: self._updating[0] = False
 
@@ -148,12 +151,12 @@ class ResizeDialog(_Base):
             if self._updating[0] or not self._lock.get(): return
             try:
                 self._updating[0] = True
-                self._w.set(round(self._h.get() * self._ow / self._oh))
+                self._vw.set(round(self._vh.get() * self._ow / self._oh))
             except Exception: pass
             finally: self._updating[0] = False
 
-        self._w.trace_add('write', on_w)
-        self._h.trace_add('write', on_h)
+        self._vw.trace_add('write', on_w)
+        self._vh.trace_add('write', on_h)
 
         # Prozent-Eingabe
         pr = tk.Frame(f, bg=PANEL); pr.pack(fill=tk.X, pady=(6, 2))
@@ -178,7 +181,7 @@ class ResizeDialog(_Base):
         for name, w, h in SOCIAL_PRESETS:
             tk.Button(inner, text=f'{name}  ({w}×{h})',
                       command=lambda _w=w, _h=h: (self._lock.set(False),
-                                                   self._w.set(_w), self._h.set(_h)),
+                                                   self._vw.set(_w), self._vh.set(_h)),
                       bg=BTN, fg=TEXT, bd=0, padx=6, pady=2, anchor='w',
                       font=('Segoe UI', 8), relief=tk.FLAT,
                       cursor='hand2').pack(fill=tk.X, pady=1)
@@ -187,14 +190,14 @@ class ResizeDialog(_Base):
     def _apply_pct(self):
         try:
             p = self._pct.get() / 100
-            self._w.set(round(self._ow * p))
-            self._h.set(round(self._oh * p))
+            self._vw.set(round(self._ow * p))
+            self._vh.set(round(self._oh * p))
         except Exception:
             pass
 
     def _ok(self):
         try:
-            self.result = (max(1, self._w.get()), max(1, self._h.get()), self._method.get())
+            self.result = (max(1, self._vw.get()), max(1, self._vh.get()), self._method.get())
         except Exception:
             pass
         self.destroy()
@@ -212,12 +215,12 @@ class CanvasSizeDialog(_Base):
     def _build(self):
         f = tk.Frame(self, bg=PANEL, padx=20, pady=14); f.pack()
         self._lbl(f, f'Aktuell: {self._ow} × {self._oh} px', dim=True).pack(anchor='w', pady=(0, 8))
-        self._w  = tk.IntVar(value=self._ow)
-        self._h  = tk.IntVar(value=self._oh)
+        self._vw  = tk.IntVar(value=self._ow)
+        self._vh  = tk.IntVar(value=self._oh)
         self._ah = tk.StringVar(value='mitte')
         self._av = tk.StringVar(value='mitte')
 
-        for lbl, var in [('Breite (px):', self._w), ('Höhe (px):', self._h)]:
+        for lbl, var in [('Breite (px):', self._vw), ('Höhe (px):', self._vh)]:
             row = tk.Frame(f, bg=PANEL); row.pack(fill=tk.X, pady=3)
             self._lbl(row, lbl).pack(side=tk.LEFT, padx=(0, 6))
             self._entry(row, var).pack(side=tk.LEFT)
@@ -234,7 +237,7 @@ class CanvasSizeDialog(_Base):
 
     def _ok(self):
         try:
-            self.result = (max(1, self._w.get()), max(1, self._h.get()),
+            self.result = (max(1, self._vw.get()), max(1, self._vh.get()),
                            self._ah.get(), self._av.get(), (255, 255, 255, 0))
         except Exception:
             pass
@@ -403,7 +406,7 @@ class AdjustDialog(tk.Toplevel):
         tk.Button(bf, text='Abbrechen', command=self.destroy,
                   bg=BTN, fg=TEXT, bd=0, padx=10, pady=4, relief=tk.FLAT).pack(side=tk.RIGHT, padx=4)
         tk.Button(bf, text='Anwenden', command=self._commit,
-                  bg=ACCENT, fg='#000', bd=0, padx=14, pady=4,
+                  bg=ACCENT, fg='#ffffff', bd=0, padx=14, pady=4,
                   relief=tk.FLAT, font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=4)
         self.grab_set()
 
@@ -438,12 +441,12 @@ class ColorBalanceDialog(tk.Toplevel):
         self._temp = tk.IntVar(value=0)
 
         for label, var, mn, mx, fmt, color in [
-            ('Rot',          self._r,    -100, 100, '{}',    '#ff6666'),
-            ('Grün',         self._g,    -100, 100, '{}',    '#66ff88'),
-            ('Blau',         self._b,    -100, 100, '{}',    '#66aaff'),
-            ('Schatten',     self._sh,   -1.0, 1.0, '{:.2f}','#aaaaaa'),
-            ('Lichter',      self._hi,   -1.0, 1.0, '{:.2f}','#ffeeaa'),
-            ('Farbtemperatur', self._temp,-100, 100, '{}',   '#ffcc88'),
+            ('Rot',          self._r,    -100, 100, '{}',    '#dc2626'),
+            ('Grün',         self._g,    -100, 100, '{}',    '#16a34a'),
+            ('Blau',         self._b,    -100, 100, '{}',    '#2563eb'),
+            ('Schatten',     self._sh,   -1.0, 1.0, '{:.2f}','#6b7280'),
+            ('Lichter',      self._hi,   -1.0, 1.0, '{:.2f}','#b45309'),
+            ('Farbtemperatur', self._temp,-100, 100, '{}',   '#c2410c'),
         ]:
             tk.Label(f, text=label, bg=PANEL, fg=color,
                      font=('Segoe UI', 8, 'bold')).pack(anchor='w', pady=(6, 0))
@@ -460,7 +463,7 @@ class ColorBalanceDialog(tk.Toplevel):
         tk.Button(bf, text='Abbrechen', command=self.destroy,
                   bg=BTN, fg=TEXT, bd=0, padx=10, pady=4, relief=tk.FLAT).pack(side=tk.RIGHT, padx=4)
         tk.Button(bf, text='Anwenden', command=self._commit,
-                  bg=ACCENT, fg='#000', bd=0, padx=14, pady=4,
+                  bg=ACCENT, fg='#ffffff', bd=0, padx=14, pady=4,
                   relief=tk.FLAT, font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=4)
 
     def _reset(self):

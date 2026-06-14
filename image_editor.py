@@ -3,6 +3,7 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser, simpledialog
+import tkinter.font as tkfont
 import json, os, io, math, threading, sys, subprocess
 from pathlib import Path
 from PIL import Image, ImageTk, ImageDraw, ImageFilter, ImageEnhance, ImageOps, ImageChops
@@ -31,6 +32,9 @@ def _check_cairosvg() -> bool:
         return False
 
 CAIROSVG_AVAIL = _check_cairosvg()
+PYMUPDF_AVAIL  = _ilu.find_spec('fitz') is not None or _ilu.find_spec('pymupdf') is not None
+SVGLIB_AVAIL   = _ilu.find_spec('svglib') is not None and _ilu.find_spec('reportlab') is not None
+PSDTOOLS_AVAIL = _ilu.find_spec('psd_tools') is not None
 
 _rembg_remove   = None   # wird beim ersten Aufruf geladen
 _rembg_new_sess = None    # rembg.new_session
@@ -108,6 +112,72 @@ def _load_cairosvg():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  RUNDER BUTTON  (Tk kann Widgets nicht abrunden → auf Canvas selbst zeichnen)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RoundedButton(tk.Canvas):
+    """Flacher Button mit abgerundeten Ecken, Hover- und Aktiv-Zustand."""
+
+    def __init__(self, parent, text='', command=None, *, width=120, height=34,
+                 radius=11, fill=BTN, hover=BTN_HOVER, fg=TEXT,
+                 active_fill=BTN_ACT, active_fg=ACCENT, container_bg=PANEL,
+                 font=('Segoe UI', 10), anchor='center', accent_bar=False):
+        super().__init__(parent, width=width, height=height, bd=0,
+                         highlightthickness=0, bg=container_bg, takefocus=0)
+        self._cmd        = command
+        self._radius     = radius
+        self._fill       = fill
+        self._hover      = hover
+        self._fg         = fg
+        self._active_fill = active_fill
+        self._active_fg   = active_fg
+        self._font       = font
+        self._text       = text
+        self._anchor     = anchor
+        self._accent_bar = accent_bar
+        self._active     = False
+        self.configure(cursor='hand2')
+        self.bind('<Configure>', lambda e: self._redraw())
+        self.bind('<Enter>',     lambda e: (not self._active) and self._redraw(self._hover))
+        self.bind('<Leave>',     lambda e: (not self._active) and self._redraw())
+        self.bind('<Button-1>',  lambda e: self._cmd() if self._cmd else None)
+
+    def _rrect(self, x1, y1, x2, y2, r, **kw):
+        r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+        return self.create_polygon(pts, smooth=True, **kw)
+
+    def _redraw(self, fill=None):
+        self.delete('all')
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1: w = int(self['width'])
+        if h <= 1: h = int(self['height'])
+        if fill is None:
+            fill = self._active_fill if self._active else self._fill
+        fg = self._active_fg if self._active else self._fg
+        self._rrect(1, 1, w - 1, h - 1, self._radius, fill=fill, outline='')
+        if self._accent_bar and self._active:
+            self._rrect(3, 6, 6, h - 6, 1, fill=ACCENT, outline='')
+        weight = 'bold' if self._active else 'normal'
+        if self._anchor == 'w':
+            self.create_text(16, h // 2, text=self._text, fill=fg, anchor='w',
+                             font=(self._font[0], self._font[1], weight))
+        else:
+            self.create_text(w // 2, h // 2, text=self._text, fill=fg,
+                             font=(self._font[0], self._font[1], weight))
+
+    def set_active(self, on):
+        self._active = bool(on)
+        self._redraw()
+
+    def configure_text(self, text):
+        self._text = text
+        self._redraw()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HAUPTANWENDUNG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -137,6 +207,9 @@ class ImageEditorApp(tk.Tk):
         self.offset_y  = 0
         self._fit_once = True
         self._pan_data: tuple | None = None   # für mittlere Maustaste
+        self._fast_render   = False           # True während Zoom/Pan → NEAREST
+        self._quality_after = None            # geplanter scharfer Nachzieh-Render
+        self._comp_cache: Image.Image | None = None  # Ebenen-Composite (Pan/Zoom-Cache)
 
         # ── Werkzeuge ─────────────────────────────────────────────────────────
         self.tool        = tk.StringVar(value='brush')
@@ -147,6 +220,9 @@ class ImageEditorApp(tk.Tk):
         self._drawing    = False
         self._painting   = False   # True während Pinsel-Drag → NEAREST resampling
         self._last_xy: tuple | None = None
+        self._last_mouse: tuple | None = None   # letzte Cursor-Position (Widget-Koord.)
+        self._paint_render_pending = False      # gedrosselter Render während des Malens
+        self._syncing_controls = False           # True während Panel-Sync (Trace stumm)
 
         # ── Render-Cache ─────────────────────────────────────────────────────
         self._checker_key: tuple | None = None
@@ -160,6 +236,8 @@ class ImageEditorApp(tk.Tk):
         # ── Zauberstab ────────────────────────────────────────────────────────
         self._wand_tol         = tk.IntVar(value=30)
         self._wand_contiguous  = tk.BooleanVar(value=True)
+        self._wand_last: tuple | None = None   # letzter Klickpunkt → Live-Toleranz
+        self._wand_after = None                # Debounce für Live-Toleranz
 
         # ── BG-Remover ────────────────────────────────────────────────────────
         self._bg_alpha_thresh  = tk.IntVar(value=10)   # 0=alles behalten, 200=aggressiv
@@ -167,11 +245,15 @@ class ImageEditorApp(tk.Tk):
         # ── SEO ───────────────────────────────────────────────────────────────
         self.seo = {k: '' for k in ['alt_text','meta_title','meta_description',
                                      'keywords','tags','author','copyright','category']}
+        # .seo.json-Sidecar NUR auf ausdrücklichen Wunsch mitspeichern (Default: aus)
+        self._seo_sidecar = tk.BooleanVar(value=False)
 
         # ── UI ────────────────────────────────────────────────────────────────
         self._layer_thumbs: list = []   # Thumbnails am Leben halten
         self._build_ui()
         self._bind_keys()
+        # Pinselgröße/Opazität ändern → Cursor-Ring sofort an letzter Position neu zeichnen
+        self.brush_size.trace_add('write', lambda *a: self._refresh_cursor_ring())
         self._update_title()
         self.set_status('Bereit  –  Ctrl+O öffnen  |  Ctrl+N neues Bild')
 
@@ -217,6 +299,17 @@ class ImageEditorApp(tk.Tk):
         self._build_canvas_area(body)
         self._build_right_panel(body)
         self._build_statusbar()
+        # Programm immer maximiert starten
+        self.after(0, self._maximize)
+
+    def _maximize(self):
+        try:
+            self.state('zoomed')          # Windows / die meisten Linux-WMs
+        except Exception:
+            try:
+                self.attributes('-zoomed', True)
+            except Exception:
+                pass
 
     # ── TTK Style ─────────────────────────────────────────────────────────────
 
@@ -226,11 +319,14 @@ class ImageEditorApp(tk.Tk):
         s.configure('TFrame',        background=PANEL)
         s.configure('TLabel',        background=PANEL, foreground=TEXT, font=('Segoe UI', 9))
         s.configure('TButton',       background=BTN, foreground=TEXT, borderwidth=0,
-                    padding=(8, 5), font=('Segoe UI', 9))
-        s.map('TButton',             background=[('active', BTN_ACT), ('pressed', ACCENT)])
-        s.configure('Accent.TButton', background=ACCENT, foreground='#000',
-                    borderwidth=0, padding=(8, 5), font=('Segoe UI', 9, 'bold'))
-        s.map('Accent.TButton',      background=[('active', '#00b8e0'), ('pressed', '#009fc0')])
+                    focuscolor=PANEL, padding=(10, 7), font=('Segoe UI', 9),
+                    relief='flat')
+        s.map('TButton',             background=[('active', BTN_HOVER), ('pressed', BTN_ACT)],
+                                     foreground=[('active', ACCENT)])
+        s.configure('Accent.TButton', background=ACCENT, foreground='#ffffff',
+                    borderwidth=0, padding=(10, 7), font=('Segoe UI', 9, 'bold'))
+        s.map('Accent.TButton',      background=[('active', '#6366f1'), ('pressed', '#4338ca')],
+                                     foreground=[('active', '#ffffff')])
         s.configure('TCheckbutton',  background=PANEL, foreground=TEXT, font=('Segoe UI', 9))
         s.map('TCheckbutton',        background=[('active', PANEL)],
                                      foreground=[('active', ACCENT)])
@@ -238,7 +334,7 @@ class ImageEditorApp(tk.Tk):
                     sliderlength=14, sliderrelief='flat')
         s.map('TScale',              background=[('active', PANEL)])
         s.configure('TCombobox',     fieldbackground=BTN, background=BTN,
-                    foreground=TEXT, selectbackground=ACCENT, selectforeground='#000',
+                    foreground=TEXT, selectbackground=ACCENT, selectforeground='#ffffff',
                     arrowcolor=TEXT_DIM)
         s.map('TCombobox',           fieldbackground=[('readonly', BTN)],
                                      foreground=[('readonly', TEXT)])
@@ -362,18 +458,21 @@ class ImageEditorApp(tk.Tk):
         # Accent-Linie unter Toolbar
         tk.Frame(self, bg=ACCENT, height=1).pack(fill=tk.X, side=tk.TOP)
 
+        tb_font = ('Segoe UI', 9)
+        _meas   = tkfont.Font(family='Segoe UI', size=9)
+
         def btn(txt, cmd, tip=''):
-            b = tk.Button(tb, text=txt, command=cmd, bg=TOOLBAR, fg=TEXT,
-                          activebackground=BTN_ACT, activeforeground=TEXT,
-                          bd=0, padx=9, pady=5, font=('Segoe UI', 9),
-                          relief=tk.FLAT, cursor='hand2')
-            b.pack(side=tk.LEFT, padx=1, pady=5)
+            w = _meas.measure(txt) + 22
+            b = RoundedButton(tb, text=txt, command=cmd, width=w, height=32,
+                              radius=9, fill=TOOLBAR, hover=BTN_HOVER, fg=TEXT,
+                              container_bg=TOOLBAR, font=tb_font)
+            b.pack(side=tk.LEFT, padx=2, pady=7)
             if tip:
                 self._tooltip(b, tip)
             return b
 
         def sep():
-            tk.Frame(tb, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=8)
+            tk.Frame(tb, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=10)
 
         btn('📄 Neu',          self.cmd_new,          'Neu (Ctrl+N)')
         btn('📂 Öffnen',       self.cmd_open,         'Öffnen (Ctrl+O)')
@@ -395,6 +494,8 @@ class ImageEditorApp(tk.Tk):
         btn('🌫 Vignette',     self.dlg_vignette,     'Vignette hinzufügen')
         btn('💧 Schatten',     self.dlg_drop_shadow,  'Schlagschatten')
         btn('🏷 Wasserzeichen',self.dlg_watermark,    'Wasserzeichen')
+        btn('🧹 Meta entfernen', self.cmd_strip_metadata,
+            'Alle Metadaten löschen (SEO-Felder + eingebettete Tags)')
 
         self._zoom_lbl = tk.Label(tb, text='100 %', bg=TOOLBAR, fg=ACCENT,
                                    font=('Segoe UI', 9, 'bold'))
@@ -410,7 +511,7 @@ class ImageEditorApp(tk.Tk):
                  font=('Segoe UI', 7, 'bold')).pack(anchor='w', padx=8, pady=(3, 2))
 
     def _build_tools_panel(self, parent):
-        f = tk.Frame(parent, bg=PANEL, width=82)
+        f = tk.Frame(parent, bg=PANEL, width=132)
         f.pack(side=tk.LEFT, fill=tk.Y)
         f.pack_propagate(False)
 
@@ -426,30 +527,31 @@ class ImageEditorApp(tk.Tk):
             ('text',       'T',   'Text'),
             ('crop',       '⊹',  'Zuschneiden'),
         ]
-        self._tool_btns: dict[str, tk.Button] = {}
+        LABELS = {'cursor': 'Auswahl', 'magic_wand': 'Zauber', 'brush': 'Pinsel',
+                  'eraser': 'Radierer', 'fill': 'Füllen', 'eyedrop': 'Pipette',
+                  'text': 'Text', 'crop': 'Crop'}
+        self._tool_btns: dict[str, RoundedButton] = {}
         for name, icon, tip in TOOLS:
-            active = name == self.tool.get()
-            b = tk.Button(f, text=icon, width=3,
-                          bg=ACCENT if active else BTN,
-                          fg='#000' if active else TEXT,
-                          activebackground=BTN_ACT, activeforeground=TEXT,
-                          bd=0, pady=6, font=('Segoe UI', 13 if len(icon)==1 else 11),
-                          relief=tk.FLAT, cursor='hand2',
-                          command=lambda n=name: self._select_tool(n))
-            b.pack(padx=6, pady=2, fill=tk.X)
+            b = RoundedButton(f, text=f'{icon}   {LABELS.get(name, "")}', anchor='w',
+                              command=lambda n=name: self._select_tool(n),
+                              width=116, height=38, radius=12,
+                              fill=BTN, hover=BTN_HOVER, fg=TEXT,
+                              active_fill=BTN_ACT, active_fg=ACCENT,
+                              container_bg=PANEL, font=('Segoe UI', 10),
+                              accent_bar=True)
+            b.pack(fill=tk.X, padx=8, pady=3)
+            b.set_active(name == self.tool.get())
             self._tool_btns[name] = b
             self._tooltip(b, tip)
 
-        # Farb-Swatches + Hex-Eingabe
+        # Farb-Swatches (abgerundet, auf Canvas gezeichnet) + Hex-Eingabe
         self._sec(f, 'FARBE')
-        sw = tk.Frame(f, bg=PANEL, width=62, height=54)
-        sw.pack(pady=4); sw.pack_propagate(False)
-        self._bg_btn = tk.Button(sw, bg=self.bg_color, bd=2, relief='solid',
-                                  cursor='hand2', command=self._pick_bg)
-        self._bg_btn.place(x=18, y=18, width=28, height=28)
-        self._fg_btn = tk.Button(sw, bg=self.fg_color, bd=2, relief='solid',
-                                  cursor='hand2', command=self._pick_fg)
-        self._fg_btn.place(x=6, y=6, width=28, height=28)
+        sw = tk.Canvas(f, bg=PANEL, width=66, height=58, bd=0,
+                       highlightthickness=0, cursor='hand2')
+        sw.pack(pady=4)
+        self._swatch = sw
+        sw.bind('<Button-1>', self._swatch_click)
+        self._draw_swatches()
 
         tk.Label(f, text='Vordergrund', bg=PANEL, fg=TEXT_DIM, font=('Segoe UI', 7)).pack(pady=(2,0))
         self._fg_hex = tk.StringVar(value=self.fg_color)
@@ -486,9 +588,11 @@ class ImageEditorApp(tk.Tk):
         ttk.Scale(wand_row, from_=0, to=255, variable=self._wand_tol,
                   orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._wand_tol.trace_add('write',
-            lambda *a: _safe_lbl(self._wand_lbl, self._wand_tol, '{}'))
+            lambda *a: (_safe_lbl(self._wand_lbl, self._wand_tol, '{}'),
+                        self._wand_live_update()))
         ttk.Checkbutton(f, text='Zusammenhängend',
-                        variable=self._wand_contiguous).pack(padx=6, anchor='w', pady=2)
+                        variable=self._wand_contiguous,
+                        command=self._wand_live_update).pack(padx=6, anchor='w', pady=2)
         tk.Button(f, text='Auswahl löschen  Del',
                   command=self.cmd_delete_selection,
                   bg=BTN, fg=TEXT, bd=0, padx=4, pady=3,
@@ -666,6 +770,13 @@ class ImageEditorApp(tk.Tk):
                        self.seo.__setitem__(k, w.get('1.0', tk.END).strip()))
                 self._seo_w[key] = t
         tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=8, pady=8)
+        ttk.Checkbutton(
+            inner, variable=self._seo_sidecar,
+            text='Beim Speichern .seo.json-Datei mit anlegen'
+            ).pack(anchor='w', padx=8, pady=2)
+        tk.Label(inner, text='(Standard: aus – es wird sonst keine Begleitdatei erzeugt)',
+                 bg=PANEL, fg=TEXT_DIM, font=('Segoe UI', 7),
+                 anchor='w', wraplength=250).pack(anchor='w', padx=8, pady=(0, 4))
         ttk.Button(inner, text='💾 SEO-JSON speichern',
                    command=self.cmd_export_seo).pack(fill=tk.X, padx=8, pady=4)
         ttk.Button(inner, text='📂 SEO-JSON laden',
@@ -715,6 +826,7 @@ class ImageEditorApp(tk.Tk):
         c.bind('<Button-2>',        self._on_pan_start)
         c.bind('<B2-Motion>',       self._on_pan_drag)
         c.bind('<Configure>',       self._on_canvas_cfg)
+        c.bind('<Leave>',           self._on_leave)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  RENDERING
@@ -732,7 +844,7 @@ class ImageEditorApp(tk.Tk):
     @staticmethod
     def _make_checker(dw: int, dh: int, cs: int) -> Image.Image:
         """Schachbrettmuster als PIL-Bild – O(W/cs + H/cs) statt O(W*H) Python-Loops."""
-        c1, c2 = (50, 50, 58), (80, 80, 90)
+        c1, c2 = (249, 249, 251), (214, 216, 221)
         ts = cs * 2
         tile = Image.new('RGB', (ts, ts))
         tile.paste(Image.new('RGB', (cs, cs), c1), (0,  0))
@@ -755,52 +867,110 @@ class ImageEditorApp(tk.Tk):
     def _render(self):
         if not self.layers:
             return
-        comp = composite(self.layers, self.canvas_w, self.canvas_h)
+        # Einzelne, normale Ebene → direkt verwenden (kein Voll-Composite nötig).
+        # Das spart beim Malen pro Frame eine komplette Leinwand-Komposition.
+        vis = [l for l in self.layers if l.visible]
+        single = (len(vis) == 1 and vis[0].opacity == 100
+                  and vis[0].blend_mode == 'Normal'
+                  and vis[0].image.size == (self.canvas_w, self.canvas_h))
+        if single:
+            comp = vis[0].image
+        elif (self._fast_render and self._comp_cache is not None
+                and self._comp_cache.size == (self.canvas_w, self.canvas_h)):
+            # Pan/Zoom ändern keine Pixel → Composite wiederverwenden
+            comp = self._comp_cache
+        else:
+            comp = composite(self.layers, self.canvas_w, self.canvas_h)
+        self._comp_cache = comp
         c    = self._canvas
-        c.delete('all')
+        c.delete('img'); c.delete('sel'); c.delete('welcome')
 
-        dw = max(1, int(self.canvas_w * self.zoom))
-        dh = max(1, int(self.canvas_h * self.zoom))
+        z      = self.zoom
         ox, oy = self.offset_x, self.offset_y
+        vw = max(c.winfo_width(), 1)
+        vh = max(c.winfo_height(), 1)
 
-        # Schachbrett aus Cache + composites Bild als EIN Canvas-Item
-        cs      = max(8, min(20, int(12 * min(self.zoom, 1.5))))
-        checker = self._get_checker(dw, dh, cs).copy()
+        # Sichtbarer Bereich in Canvas-Koordinaten (berücksichtigt Scrollbars)
+        vx0, vy0 = c.canvasx(0),  c.canvasy(0)
+        vx1, vy1 = c.canvasx(vw), c.canvasy(vh)
 
-        # Während aktiven Pinsel-Strokes: NEAREST (schnell); danach LANCZOS
-        rs   = Image.NEAREST if (self.zoom > 5 or self._painting) else Image.LANCZOS
-        disp = comp.resize((dw, dh), rs)
-        checker.paste(disp, mask=disp.split()[3])
+        # → nur den TATSÄCHLICH sichtbaren Bildausschnitt skalieren.
+        #   Das verhindert das Einfrieren bei hohem Zoom (sonst würde das
+        #   komplette Bild auf riesige dw×dh hochskaliert).
+        ix0 = max(0,             int(math.floor((vx0 - ox) / z)))
+        iy0 = max(0,             int(math.floor((vy0 - oy) / z)))
+        ix1 = min(self.canvas_w, int(math.ceil ((vx1 - ox) / z)))
+        iy1 = min(self.canvas_h, int(math.ceil ((vy1 - oy) / z)))
 
-        self.photo_img = ImageTk.PhotoImage(checker)
-        c.create_image(ox, oy, anchor='nw', image=self.photo_img, tags='img')
+        if ix1 > ix0 and iy1 > iy0:
+            crop = comp.crop((ix0, iy0, ix1, iy1))
+            dw = max(1, int(round((ix1 - ix0) * z)))
+            dh = max(1, int(round((iy1 - iy0) * z)))
 
-        # Auswahl-Rahmen (bbox hat Vorrang, sonst aus Maske ableiten)
-        display_bbox = self._sel_bbox
-        if display_bbox is None and self._sel_mask is not None:
-            try:
-                bb = self._sel_mask.getbbox()
-                if bb:
-                    display_bbox = bb
-            except Exception:
-                pass
-        if display_bbox:
-            x1, y1, x2, y2 = display_bbox
+            cs      = max(8, min(20, int(12 * min(z, 1.5))))
+            checker = self._get_checker(dw, dh, cs).copy()
+
+            # Schnelles NEAREST bei Zoom/Pan/Pinsel oder extremem Zoom; sonst scharf
+            fast = self._fast_render or self._painting or z > 8
+            rs   = Image.NEAREST if fast else Image.LANCZOS
+            disp = crop.resize((dw, dh), rs)
+
+            # Zauberstab-Auswahl: EXAKTE Form als Tönung + Kontur einblenden
+            # (statt nur das grobe Begrenzungsrechteck).
+            if self._sel_mask is not None:
+                m = self._sel_mask.crop((ix0, iy0, ix1, iy1)).resize((dw, dh), Image.NEAREST)
+                r, g, b = self._hex2rgb(ACCENT)
+                overlay = Image.new('RGBA', (dw, dh), (0, 0, 0, 0))
+                overlay.paste(Image.new('RGBA', (dw, dh), (r, g, b, 80)), mask=m)
+                edge = m.filter(ImageFilter.FIND_EDGES)
+                overlay.paste(Image.new('RGBA', (dw, dh), (r, g, b, 255)), mask=edge)
+                disp = Image.alpha_composite(disp.convert('RGBA'), overlay)
+
+            checker.paste(disp, mask=disp.split()[3])
+
+            self.photo_img = ImageTk.PhotoImage(checker)
+            c.create_image(ox + ix0 * z, oy + iy0 * z, anchor='nw',
+                           image=self.photo_img, tags='img')
+
+        # Rechteck-Auswahl (Auswahl-Werkzeug) als gestrichelter Rahmen.
+        # Bei der Zauberstab-Maske zeigt stattdessen die Tönung oben die Form.
+        if self._sel_mask is None and self._sel_bbox is not None:
+            x1, y1, x2, y2 = self._sel_bbox
             c.create_rectangle(
-                x1 * self.zoom + ox, y1 * self.zoom + oy,
-                x2 * self.zoom + ox, y2 * self.zoom + oy,
+                x1 * z + ox, y1 * z + oy, x2 * z + ox, y2 * z + oy,
                 outline=ACCENT, width=1, dash=(4, 3), tags='sel')
 
-        cw = max(c.winfo_width(), 1)
-        ch = max(c.winfo_height(), 1)
+        # Cursor-Ring zuletzt neu zeichnen, damit er beim Malen NICHT verdeckt wird
+        if self._last_mouse is not None:
+            self._draw_cursor_ring(*self._last_mouse)
+
+        full_w = self.canvas_w * z
+        full_h = self.canvas_h * z
         c.configure(scrollregion=(
             min(0, ox), min(0, oy),
-            max(cw, dw + ox), max(ch, dh + oy)))
+            max(vw, full_w + ox), max(vh, full_h + oy)))
 
         self._update_info()
-        self._update_layer_panel_controls()
+        # _update_layer_panel_controls() NICHT hier aufrufen – das setzt
+        # _blend_var/_layer_opac, deren Traces erneut _render() auslösen
+        # (Feedback-Schleife → ~45 ms pro Frame, Pinsel ruckelt). Es wird
+        # stattdessen bei Ebenenwechsel über _refresh_layer_list() aktualisiert.
+
+    def _schedule_quality_render(self, delay=140):
+        """Nach Zoom/Pan kurz warten und dann scharf (LANCZOS) nachzeichnen."""
+        if self._quality_after is not None:
+            try: self.after_cancel(self._quality_after)
+            except Exception: pass
+        def finish():
+            self._quality_after = None
+            self._fast_render = False
+            self._render()
+        self._quality_after = self.after(delay, finish)
 
     def _c2i(self, cx, cy):
+        # Widget- → Canvas-Koordinaten (Scrollbars) → Bild-Koordinaten
+        cx = self._canvas.canvasx(cx)
+        cy = self._canvas.canvasy(cy)
         return (cx - self.offset_x) / self.zoom, (cy - self.offset_y) / self.zoom
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -808,6 +978,7 @@ class ImageEditorApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _on_down(self, ev):
+        self._last_mouse = (ev.x, ev.y)
         if not self.layers:
             return
         ix, iy = self._c2i(ev.x, ev.y)
@@ -833,6 +1004,7 @@ class ImageEditorApp(tk.Tk):
             self._add_text(ix, iy)
 
     def _on_drag(self, ev):
+        self._last_mouse = (ev.x, ev.y)
         if not self.layers:
             return
         ix, iy = self._c2i(ev.x, ev.y)
@@ -841,12 +1013,29 @@ class ImageEditorApp(tk.Tk):
             self._painting = True
             self._paint_line(*self._last_xy, ix, iy, tool)
             self._last_xy = (ix, iy)
-            self._render()
+            # Strich ist gezeichnet – Anzeige nur gedrosselt aktualisieren,
+            # damit sich bei schneller Bewegung keine Renders stauen (kein Ruckeln).
+            self._request_paint_render()
         elif tool == 'cursor' and self._sel_start:
             sx, sy = self._sel_start
             self._sel_bbox = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
             self._sel_mask = None
             self._render()
+
+    def _request_paint_render(self):
+        """Render während eines Pinselstrichs zusammenfassen → max. ~1 pro 20 ms.
+        Verhindert das Stauen vieler teurer Renders bei schneller Mausbewegung."""
+        # Ring sofort an die neue Position setzen (fühlt sich direkt an)
+        if self._last_mouse is not None:
+            self._draw_cursor_ring(*self._last_mouse)
+        if self._paint_render_pending:
+            return
+        self._paint_render_pending = True
+        self.after(20, self._do_paint_render)
+
+    def _do_paint_render(self):
+        self._paint_render_pending = False
+        self._render()
 
     def _on_up(self, ev):
         was_painting = self._painting
@@ -856,9 +1045,12 @@ class ImageEditorApp(tk.Tk):
         if self.tool.get() == 'cursor':
             self._sel_start = None
         if was_painting:
-            self._render()   # abschließender LANCZOS-Render nach dem Malen
+            # ausstehenden gedrosselten Render verwerfen, einmal scharf nachzeichnen
+            self._paint_render_pending = False
+            self._render()
 
     def _on_move(self, ev):
+        self._last_mouse = (ev.x, ev.y)
         if not self.layers:
             return
         ix, iy = self._c2i(ev.x, ev.y)
@@ -869,9 +1061,51 @@ class ImageEditorApp(tk.Tk):
                 self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}    {px}')
             except Exception:
                 self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}')
+        self._draw_cursor_ring(ev.x, ev.y)
+
+    def _draw_cursor_ring(self, sx, sy):
+        """Zeigt bei Pinsel/Radierer einen Kreis in Pinselgröße am Cursor."""
+        c = self._canvas
+        c.delete('cursor_ring')
+        if not self.layers or self.tool.get() not in ('brush', 'eraser'):
+            return
+        cx, cy = c.canvasx(sx), c.canvasy(sy)
+        r = max(1, self.brush_size.get() / 2) * self.zoom
+        col = ACCENT2 if self.tool.get() == 'eraser' else CURSOR_RING
+        c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                      outline=col, width=1, tags='cursor_ring')
+        c.create_line(cx - 4, cy, cx + 4, cy, fill=col, tags='cursor_ring')
+        c.create_line(cx, cy - 4, cx, cy + 4, fill=col, tags='cursor_ring')
+
+    def _refresh_cursor_ring(self):
+        """Ring an der letzten Mausposition neu zeichnen (z. B. nach Größenänderung)."""
+        if self._last_mouse is not None:
+            self._draw_cursor_ring(*self._last_mouse)
+
+    def _on_leave(self, ev):
+        self._last_mouse = None
+        self._canvas.delete('cursor_ring')
 
     def _on_wheel(self, ev):
-        self._set_zoom(self.zoom * (1.15 if ev.delta > 0 else 1/1.15))
+        self._zoom_at(ev.x, ev.y, 1.15 if ev.delta > 0 else 1 / 1.15)
+
+    def _zoom_at(self, sx, sy, factor):
+        """Zoom zum Mauszeiger – der Punkt unter dem Cursor bleibt fix."""
+        old = self.zoom
+        new = max(0.02, min(32.0, old * factor))
+        if abs(new - old) < 1e-9:
+            return
+        cx, cy = self._canvas.canvasx(sx), self._canvas.canvasy(sy)
+        ix = (cx - self.offset_x) / old
+        iy = (cy - self.offset_y) / old
+        self.offset_x = cx - ix * new
+        self.offset_y = cy - iy * new
+        self.zoom = new
+        self._zoom_lbl.config(text=f'{self.zoom * 100:.0f} %')
+        self._fast_render = True
+        self._render()
+        self._schedule_quality_render()
+        self._draw_cursor_ring(sx, sy)
 
     def _on_pan_start(self, ev):
         self._pan_data = (ev.x, ev.y, self.offset_x, self.offset_y)
@@ -881,7 +1115,9 @@ class ImageEditorApp(tk.Tk):
             sx, sy, ox, oy = self._pan_data
             self.offset_x = ox + (ev.x - sx)
             self.offset_y = oy + (ev.y - sy)
+            self._fast_render = True
             self._render()
+            self._schedule_quality_render()
 
     def _on_canvas_cfg(self, ev):
         if self.layers and self._fit_once:
@@ -939,16 +1175,17 @@ class ImageEditorApp(tk.Tk):
         tol      = self._wand_tol.get()
         contig   = self._wand_contiguous.get()
         w, h     = img.size
+        self._wand_last = (x, y)   # für Live-Aktualisierung beim Tolerieren
 
         # RGB-Array (vektorisiert statt pixelweiser Python-Schleife → kein „Aufhängen")
         arr = np.asarray(img.convert('RGB'), dtype=np.int16)   # (h, w, 3)
-        tr, tg, tb = (int(v) for v in arr[y, x])
+        target = arr[y, x].astype(np.int16)
 
-        # Manhattan-Farbdistanz, einmal über das ganze Bild
-        dist  = (np.abs(arr[:, :, 0] - tr)
-                 + np.abs(arr[:, :, 1] - tg)
-                 + np.abs(arr[:, :, 2] - tb))
-        match = dist <= tol * 3                                # bool (h, w)
+        # Max-Kanal-Differenz (Chebyshev): Regler 0–255 = „erlaubte Abweichung
+        # pro Farbkanal" – das ist intuitiv und trifft Flächen sauberer als die
+        # alte aufsummierte Manhattan-Distanz.
+        dist  = np.abs(arr - target).max(axis=2)
+        match = dist <= tol                                    # bool (h, w)
 
         if contig:
             # Nur die mit dem Startpunkt zusammenhängende Region behalten
@@ -969,6 +1206,19 @@ class ImageEditorApp(tk.Tk):
         self._sel_bbox = None
         self.set_status(f'Zauberstab: {n:,} Pixel ausgewählt  (Toleranz {tol})')
         self._render()
+
+    def _wand_live_update(self):
+        """Toleranz-Regler bewegt → Auswahl am letzten Klickpunkt neu berechnen."""
+        if self._wand_last is None or not self.layers:
+            return
+        if self._wand_after is not None:
+            try: self.after_cancel(self._wand_after)
+            except Exception: pass
+        def run():
+            self._wand_after = None
+            if self._wand_last:
+                self._magic_wand_select(*self._wand_last)
+        self._wand_after = self.after(60, run)
 
     @staticmethod
     def _flood_bool(match, x, y):
@@ -1026,9 +1276,13 @@ class ImageEditorApp(tk.Tk):
         self._zoom_lbl.config(text=f'{self.zoom * 100:.0f} %')
         self._render()
 
-    def zoom_in(self):      self._set_zoom(self.zoom * 1.25)
-    def zoom_out(self):     self._set_zoom(self.zoom / 1.25)
+    def zoom_in(self):  self._zoom_center(1.25)
+    def zoom_out(self): self._zoom_center(1 / 1.25)
     def zoom_actual(self):  self._set_zoom(1.0)
+
+    def _zoom_center(self, factor):
+        c = self._canvas
+        self._zoom_at(c.winfo_width() // 2, c.winfo_height() // 2, factor)
 
     def zoom_fit(self):
         if not self.layers:
@@ -1076,7 +1330,11 @@ class ImageEditorApp(tk.Tk):
     def _load(self, path: Path):
         ext = path.suffix.lower()
         try:
-            if ext == '.svg':
+            if ext == '.psd':
+                if self._open_psd(path):       # füllt self.layers selbst
+                    return
+                img = None
+            elif ext == '.svg':
                 img = self._open_svg(path)
             elif ext == '.eps':
                 img = self._open_eps(path)
@@ -1105,32 +1363,104 @@ class ImageEditorApp(tk.Tk):
             self.layers     = [Layer(img, path.stem)]
             self.active_idx = 0
             self.canvas_w, self.canvas_h = img.size
-            self.file_path = path
-            self.undo_stack.clear(); self.redo_stack.clear()
-            self._sel_bbox = None; self._fit_once = True
-            self._checker_key = None   # Checker-Cache ungültig machen
-            self._load_seo(path)
-            self.after(60, self.zoom_fit)
-            self._render(); self._refresh_layer_list()
-            self._update_title()
-            self.set_status(f'Geöffnet: {path.name}   {img.width}×{img.height} px')
+            self._post_load(path)
         except Exception as e:
             messagebox.showerror('Fehler beim Öffnen', str(e))
 
-    def _open_svg(self, path):
-        if CAIROSVG_AVAIL:
-            cs = _load_cairosvg()
-            if cs:
-                try:
-                    data = cs.svg2png(url=str(path), scale=2.0)
-                    return Image.open(io.BytesIO(data))
-                except Exception as e:
-                    messagebox.showerror('SVG-Fehler', str(e)); return None
+    def _post_load(self, path: Path):
+        """Gemeinsamer Abschluss nach dem Setzen von self.layers / canvas_w/h."""
+        self.file_path = path
+        self.undo_stack.clear(); self.redo_stack.clear()
+        self._sel_bbox = None; self._sel_mask = None
+        self._wand_last = None; self._fit_once = True
+        self._checker_key = None   # Checker-Cache ungültig machen
+        self._load_seo(path)
+        self.after(60, self.zoom_fit)
+        self._render(); self._refresh_layer_list()
+        self._update_title()
+        self.set_status(
+            f'Geöffnet: {path.name}   {self.canvas_w}×{self.canvas_h} px'
+            f'   ({len(self.layers)} Ebene(n))')
+
+    def _open_psd(self, path) -> bool:
+        """PSD öffnen. Mit psd-tools bleiben die Ebenen erhalten; sonst Fallback
+        auf das von Pillow zusammengefasste Gesamtbild."""
+        if PSDTOOLS_AVAIL:
+            try:
+                from psd_tools import PSDImage
+                psd = PSDImage.open(str(path))
+                W, H = psd.width, psd.height
+                layers: list[Layer] = []
+                Layer._counter = 0
+                # psd-tools liefert Ebenen von unten nach oben
+                for lyr in psd:
+                    try:
+                        pil = lyr.composite()
+                    except Exception:
+                        pil = None
+                    if pil is None:
+                        continue
+                    pil = pil.convert('RGBA')
+                    # Ebene auf volle Leinwandgröße an ihrer Position einbetten
+                    canvas = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+                    off = getattr(lyr, 'offset', (0, 0)) or (0, 0)
+                    canvas.paste(pil, (int(off[0]), int(off[1])))
+                    layers.append(Layer(canvas, lyr.name or None,
+                                        visible=bool(getattr(lyr, 'visible', True))))
+                if not layers:                       # nur ein zusammengefasstes Bild
+                    comp = psd.composite().convert('RGBA')
+                    layers = [Layer(comp, path.stem)]
+                self.layers     = layers
+                self.active_idx = len(layers) - 1
+                self.canvas_w, self.canvas_h = W, H
+                self._post_load(path)
+                return True
+            except Exception as e:
+                messagebox.showwarning(
+                    'PSD', f'psd-tools-Import fehlgeschlagen, nutze Gesamtbild.\n{e}')
+        # Fallback: Pillow liest das zusammengefasste Vorschaubild
         try:
-            return Image.open(path)
+            raw = Image.open(path, formats=['PSD']); raw.load()
+            img = raw.convert('RGBA')
+            Layer._counter = 0
+            self.layers     = [Layer(img, path.stem)]
+            self.active_idx = 0
+            self.canvas_w, self.canvas_h = img.size
+            if not PSDTOOLS_AVAIL:
+                self.set_status('PSD zusammengefasst geöffnet – für Ebenen: '
+                                'pip install psd-tools')
+            self._post_load(path)
+            return True
+        except Exception as e:
+            messagebox.showerror('PSD-Fehler', str(e))
+            return False
+
+    def _open_svg(self, path):
+        # 1) PyMuPDF/fitz – komplett eigenständige Windows-Wheels, KEINE native DLL nötig.
+        try:
+            import fitz
+            doc = fitz.open(str(path))
+            pdfbytes = doc.convert_to_pdf()
+            pdf = fitz.open('pdf', pdfbytes)
+            pix = pdf[0].get_pixmap(matrix=fitz.Matrix(2, 2), alpha=True)
+            mode = 'RGBA' if pix.alpha else 'RGB'
+            return Image.frombytes(mode, (pix.width, pix.height), pix.samples).convert('RGBA')
         except Exception:
-            messagebox.showwarning('SVG', 'Bitte cairosvg installieren:\npip install cairosvg')
-            return None
+            pass
+        # 2) cairosvg (beste Qualität, braucht aber natives Cairo)
+        cs = _load_cairosvg()
+        if cs:
+            try:
+                data = cs.svg2png(url=str(path), scale=2.0)
+                return Image.open(io.BytesIO(data)).convert('RGBA')
+            except Exception:
+                pass
+        messagebox.showwarning(
+            'SVG',
+            'Zum Öffnen von SVG wird PyMuPDF benötigt (ohne Zusatz-DLL):\n\n'
+            '       pip install pymupdf\n\n'
+            'Menü „Hilfe -> Pakete installieren" erledigt das automatisch.')
+        return None
 
     def _open_eps(self, path):
         try:
@@ -1314,16 +1644,27 @@ class ImageEditorApp(tk.Tk):
         self.image = Image.merge('RGBA', (*rgb.split(), a)); self._render()
 
     def cmd_resize(self):
-        if self.image is None: return
-        dlg = ResizeDialog(self, self.image.size)
-        if dlg.result:
-            w, h, method = dlg.result
-            self._push_undo()
-            rs = {'Lanczos': Image.LANCZOS, 'Bicubic': Image.BICUBIC,
-                  'Bilinear': Image.BILINEAR, 'Nächster Pixel': Image.NEAREST}
-            self.image = self.image.resize((w, h), rs.get(method, Image.LANCZOS))
-            self.zoom_fit(); self._render()
-            self.set_status(f'Skaliert: {w}×{h} px')
+        if not self.layers:
+            self.set_status('Kein Bild geöffnet'); return
+        dlg = ResizeDialog(self, (self.canvas_w, self.canvas_h))
+        if not dlg.result:
+            return
+        w, h, method = dlg.result
+        w, h = max(1, int(w)), max(1, int(h))
+        if (w, h) == (self.canvas_w, self.canvas_h):
+            self.set_status('Größe unverändert'); return
+        self._push_undo()
+        rs = {'Lanczos': Image.LANCZOS, 'Bicubic': Image.BICUBIC,
+              'Bilinear': Image.BILINEAR, 'Nächster Pixel': Image.NEAREST
+              }.get(method, Image.LANCZOS)
+        # Alle Ebenen mitskalieren (alle liegen auf voller Leinwandgröße)
+        for layer in self.layers:
+            layer.image = layer.image.resize((w, h), rs)
+        self.canvas_w, self.canvas_h = w, h
+        self._sel_bbox = None; self._sel_mask = None; self._wand_last = None
+        self._checker_key = None
+        self.zoom_fit(); self._render()
+        self.set_status(f'Bildgröße geändert: {w} × {h} px')
 
     def cmd_canvas_size(self):
         if not self.layers: return
@@ -1338,6 +1679,7 @@ class ImageEditorApp(tk.Tk):
                 new_img.paste(layer.image, (xm.get(ah,0), ym.get(av,0)))
                 layer.image = new_img
             self.canvas_w, self.canvas_h = nw, nh
+            self._checker_key = None
             self.zoom_fit(); self._render()
 
     def cmd_crop_selection(self):
@@ -1363,6 +1705,7 @@ class ImageEditorApp(tk.Tk):
     def cmd_deselect(self):
         self._sel_bbox = None
         self._sel_mask = None
+        self._wand_last = None
         self._render()
 
     def cmd_delete_selection(self):
@@ -1695,12 +2038,12 @@ class ImageEditorApp(tk.Tk):
             self._refresh_layer_list()
 
     def _on_blend_changed(self):
-        if not self.layers: return
+        if not self.layers or self._syncing_controls: return
         self.layers[self.active_idx].blend_mode = self._blend_var.get()
         self._render()
 
     def _on_layer_opac_changed(self):
-        if not self.layers: return
+        if not self.layers or self._syncing_controls: return
         try:
             v = self._layer_opac.get()
             self.layers[self.active_idx].opacity = v
@@ -1713,14 +2056,19 @@ class ImageEditorApp(tk.Tk):
         if not self.layers or self.active_idx >= len(self.layers):
             return
         layer = self.layers[self.active_idx]
-        self._blend_var.set(layer.blend_mode)
+        # Während des Setzens die Traces stummschalten (sonst lösen sie _render aus)
+        self._syncing_controls = True
         try:
+            self._blend_var.set(layer.blend_mode)
             self._layer_opac.set(layer.opacity)
         except Exception:
             pass
+        finally:
+            self._syncing_controls = False
 
     def _refresh_layer_list(self):
         """Ebenen-Panel neu aufbauen (Ebenen in umgekehrter Reihenfolge wie Photoshop)."""
+        self._update_layer_panel_controls()
         for w in self._layer_list.winfo_children():
             w.destroy()
         self._layer_thumbs.clear()
@@ -1790,6 +2138,9 @@ class ImageEditorApp(tk.Tk):
                 pass
 
     def _save_seo(self, img_path: Path):
+        # Sidecar nur schreiben, wenn der Nutzer es aktiviert hat UND Daten da sind.
+        if not self._seo_sidecar.get() or not any(self.seo.values()):
+            return
         try:
             with open(img_path.with_suffix('.seo.json'), 'w', encoding='utf-8') as f:
                 json.dump(self.seo, f, ensure_ascii=False, indent=2)
@@ -1815,6 +2166,29 @@ class ImageEditorApp(tk.Tk):
                 self.set_status('SEO-Metadaten importiert')
             except Exception as e:
                 messagebox.showerror('Fehler', str(e))
+
+    def cmd_strip_metadata(self):
+        """Alle Metadaten entfernen: SEO-Felder leeren, Sidecar abschalten und
+        eingebettete Tags (EXIF/PNG-Info/ICC) aus allen Ebenen löschen."""
+        # 1) SEO-Felder leeren + Begleitdatei abschalten
+        for k in self.seo:
+            self.seo[k] = ''
+        self._seo_sidecar.set(False)
+        try:
+            self._refresh_seo_ui()
+        except Exception:
+            pass
+        # 2) Eingebettete Metadaten aus den Bilddaten entfernen
+        n = 0
+        for layer in self.layers:
+            img = layer.image
+            if getattr(img, 'info', None):
+                img.info.clear(); n += 1
+            for attr in ('_exif', 'applist'):
+                if hasattr(img, attr):
+                    try: delattr(img, attr)
+                    except Exception: pass
+        self.set_status('Metadaten entfernt – Exporte enthalten keine EXIF/SEO-Tags mehr')
 
     def cmd_export_seo(self):
         default = (self.file_path.stem + '.seo') if self.file_path else 'metadata.seo'
@@ -1845,15 +2219,37 @@ class ImageEditorApp(tk.Tk):
         h = self._norm_hex(h)
         if h:
             self.fg_color = h
-            self._fg_btn.configure(bg=h)
+            self._draw_swatches()
             self._fg_hex.set(h)
 
     def _set_bg(self, h: str):
         h = self._norm_hex(h)
         if h:
             self.bg_color = h
-            self._bg_btn.configure(bg=h)
+            self._draw_swatches()
             self._bg_hex.set(h)
+
+    # Geometrie der beiden Farbfelder (x1, y1, x2, y2)
+    _FG_RECT = (8, 4, 40, 36)
+    _BG_RECT = (26, 22, 58, 54)
+
+    def _draw_swatches(self):
+        c = self._swatch
+        c.delete('all')
+        def rr(x1, y1, x2, y2, r, **kw):
+            pts = [x1+r,y1, x2-r,y1, x2,y1, x2,y1+r, x2,y2-r, x2,y2,
+                   x2-r,y2, x1+r,y2, x1,y2, x1,y2-r, x1,y1+r, x1,y1]
+            c.create_polygon(pts, smooth=True, **kw)
+        rr(*self._BG_RECT, 7, fill=self.bg_color, outline=TEXT_DIM, width=2)
+        rr(*self._FG_RECT, 7, fill=self.fg_color, outline=TEXT, width=2)
+
+    def _swatch_click(self, ev):
+        fx1, fy1, fx2, fy2 = self._FG_RECT
+        if fx1 <= ev.x <= fx2 and fy1 <= ev.y <= fy2:
+            self._pick_fg(); return
+        bx1, by1, bx2, by2 = self._BG_RECT
+        if bx1 <= ev.x <= bx2 and by1 <= ev.y <= by2:
+            self._pick_bg()
 
     def _apply_hex_fg(self): self._set_fg(self._fg_hex.get())
     def _apply_hex_bg(self): self._set_bg(self._bg_hex.get())
@@ -1871,17 +2267,25 @@ class ImageEditorApp(tk.Tk):
         h = h.lstrip('#')
         return tuple(int(h[i:i+2], 16) for i in (0,2,4))
 
+    _TOOL_NAMES = {'cursor': 'Auswahl-Rechteck', 'magic_wand': 'Zauberstab',
+                   'brush': 'Pinsel', 'eraser': 'Radierer', 'fill': 'Füllen',
+                   'eyedrop': 'Pipette', 'text': 'Text', 'crop': 'Zuschneiden'}
+
     def _select_tool(self, name: str):
         self.tool.set(name)
         for n, b in self._tool_btns.items():
-            active = (n == name)
-            b.configure(bg=ACCENT if active else BTN, fg='#000' if active else TEXT)
-        CURSORS = {'cursor': 'arrow', 'brush': 'pencil', 'eraser': 'dotbox',
-                   'fill': 'spraycan', 'eyedrop': 'crosshair', 'text': 'xterm', 'crop': 'sizing'}
-        try:
-            self._canvas.configure(cursor=CURSORS.get(name, 'crosshair'))
-        except Exception:
-            self._canvas.configure(cursor='crosshair')
+            b.set_active(n == name)
+        # Cursor je Werkzeug – pro Name absichern (manche X11-Cursor fehlen unter Windows)
+        CURSORS = {'cursor': 'arrow', 'magic_wand': 'target', 'brush': 'crosshair',
+                   'eraser': 'crosshair', 'fill': 'dotbox', 'eyedrop': 'crosshair',
+                   'text': 'xterm', 'crop': 'sizing'}
+        for cur in (CURSORS.get(name, 'crosshair'), 'crosshair', 'arrow'):
+            try:
+                self._canvas.configure(cursor=cur); break
+            except Exception:
+                continue
+        self._canvas.delete('cursor_ring')
+        self.set_status(f'Werkzeug: {self._TOOL_NAMES.get(name, name)}')
 
     def _update_title(self):
         name = self.file_path.name if self.file_path else 'Unbenannt'
@@ -1920,12 +2324,18 @@ class ImageEditorApp(tk.Tk):
         def hide(ev):
             nonlocal tip
             if tip: tip.destroy(); tip = None
-        widget.bind('<Enter>', show); widget.bind('<Leave>', hide)
+        # add='+', damit Hover-Effekte (RoundedButton) erhalten bleiben
+        widget.bind('<Enter>', show, add='+'); widget.bind('<Leave>', hide, add='+')
 
     def cmd_install_deps(self):
-        pkgs = ['rembg', 'cairosvg']
+        pkgs = ['rembg', 'pymupdf', 'psd-tools', 'numpy', 'scipy']
         if messagebox.askyesno('Pakete installieren',
-                               f'Installieren:\n' + '\n'.join(f'  • {p}' for p in pkgs)):
+                               'Optionale Funktionen aktivieren:\n\n'
+                               '  • rembg       – Hintergrund entfernen (KI)\n'
+                               '  • pymupdf     – SVG öffnen\n'
+                               '  • psd-tools   – PSD mit Ebenen\n'
+                               '  • numpy/scipy – Zauberstab\n\n'
+                               'Jetzt installieren?'):
             def worker():
                 for p in pkgs:
                     try: subprocess.check_call([sys.executable,'-m','pip','install',p],
@@ -1940,7 +2350,7 @@ class ImageEditorApp(tk.Tk):
         messagebox.showinfo('Image Editor Pro',
             'Image Editor Pro  v2.0\n\n'
             '✔ Ebenen-System mit 10 Blend-Modi\n'
-            '✔ PNG, JPG, WebP, BMP, TIFF, ICO, GIF, SVG*, EPS*\n'
+            '✔ PNG, JPG, WebP, BMP, TIFF, ICO, GIF, PSD*, SVG*, EPS*\n'
             '✔ Hintergrund entfernen (rembg / KI)\n'
             '✔ Vignette, Wasserzeichen, Rahmen, Schlagschatten\n'
             '✔ Farb-Balance, Weißabgleich, Unscharf-Maske\n'

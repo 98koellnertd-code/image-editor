@@ -1,18 +1,21 @@
 """Farben, Presets, Dateitypen für Image Editor Pro"""
 
-# ── Theme ──────────────────────────────────────────────────────────────────
-BG        = '#0f1117'
-PANEL     = '#161b27'
-PANEL2    = '#1c2333'
-ACCENT    = '#00d4ff'
-ACCENT2   = '#ff4466'
-TEXT      = '#e8edf8'
-TEXT_DIM  = '#5a6e96'
-BORDER    = '#232e44'
-BTN       = '#1e2b44'
-BTN_ACT   = '#2a3f66'
-CANVAS_BG = '#1a1a28'
-TOOLBAR   = '#12182a'
+# ── Theme  (hell, modern – helles Grau statt Dunkelblau) ────────────────────
+BG        = '#e9ebef'   # App-Hintergrund (helles Grau)
+PANEL     = '#f6f7f9'   # Panels, fast weiß
+PANEL2    = '#eceef2'   # eingelassene Felder / Eingaben
+ACCENT    = '#4f46e5'   # Indigo – dezenter moderner Akzent
+ACCENT2   = '#ef4444'   # Rot (Radierer, Warnungen)
+TEXT      = '#222630'   # nahezu Schwarz
+TEXT_DIM  = '#6b7280'   # sekundäres Grau
+BORDER    = '#d6d9df'   # feine Trennlinien
+BTN       = '#e9ebf0'   # Button-Fläche
+BTN_ACT   = '#d5dae6'   # aktiver/gedrückter Button
+BTN_HOVER = '#dde1e9'   # Hover-Zustand
+CANVAS_BG = '#cfd2d8'   # mittleres Grau hinter dem Bild
+TOOLBAR   = '#f0f1f4'   # Toolbar / Statusleiste
+ACCENT_DIM = '#a5b4fc'  # heller Indigo (Rahmen/Glow)
+CURSOR_RING = '#4f46e5' # Pinsel-Ring auf dem Canvas
 
 # ── Ebenenmodi ────────────────────────────────────────────────────────────
 BLEND_MODES = [
@@ -23,10 +26,11 @@ BLEND_MODES = [
 
 # ── Dateitypen ─────────────────────────────────────────────────────────────
 OPEN_TYPES = [
-    ('Alle Bilder', '*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp *.ico *.gif *.svg *.eps *.ppm'),
+    ('Alle Bilder', '*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp *.ico *.gif *.svg *.eps *.ppm *.psd'),
     ('PNG',  '*.png'), ('JPEG', '*.jpg *.jpeg'), ('WebP', '*.webp'),
     ('BMP',  '*.bmp'), ('TIFF', '*.tiff *.tif'), ('ICO',  '*.ico'),
     ('GIF',  '*.gif'), ('SVG',  '*.svg'),        ('EPS',  '*.eps'),
+    ('Photoshop', '*.psd'),
     ('Alle Dateien', '*.*'),
 ]
 SAVE_TYPES = [
