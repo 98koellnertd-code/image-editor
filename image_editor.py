@@ -227,6 +227,10 @@ class ImageEditorApp(tk.Tk):
         # ── Render-Cache ─────────────────────────────────────────────────────
         self._checker_key: tuple | None = None
         self._checker_img: Image.Image | None = None
+        self._patch_imgs: list = []               # PhotoImage-Refs der Mal-Patches
+        self._stroke_dirty: tuple | None = None   # bemalter Bereich seit letztem Frame (Bildkoord.)
+        self._zoom_render_pending = False         # gedrosselter Zoom-Render (Mausrad)
+        self._pan_render_pending  = False         # gedrosselter Pan-Render
 
         # ── Auswahl ───────────────────────────────────────────────────────────
         self._sel_start: tuple | None        = None
@@ -420,6 +424,19 @@ class ImageEditorApp(tk.Tk):
         fx_m.add_command(label='Wasserzeichen…',  command=self.dlg_watermark)
         fx_m.add_command(label='Rahmen…',         command=self.dlg_border)
         fx_m.add_command(label='Schlagschatten…', command=self.dlg_drop_shadow)
+        fx_m.add_separator()
+        fx_m.add_command(label='Sepia',                command=self.cmd_sepia)
+        fx_m.add_command(label='Posterisieren…',       command=self.cmd_posterize)
+        fx_m.add_command(label='Schwellenwert (S/W)…', command=self.cmd_threshold)
+        fx_m.add_command(label='Farbton verschieben…', command=self.cmd_hue_shift)
+        fx_m.add_separator()
+        fx_m.add_command(label='Verpixeln / Mosaik…',  command=self.cmd_pixelate)
+        fx_m.add_command(label='Bewegungsunschärfe…',  command=self.cmd_motion_blur)
+        fx_m.add_separator()
+        fx_m.add_command(label='Emboss (Relief)',      command=self.cmd_emboss)
+        fx_m.add_command(label='Kanten finden',        command=self.cmd_find_edges)
+        fx_m.add_command(label='Bleistift-Skizze',     command=self.cmd_sketch)
+        fx_m.add_command(label='Ölgemälde…',           command=self.cmd_oil_paint)
         fx_m.add_separator()
         fx_m.add_command(label='Farb-Palette anzeigen', command=self.cmd_color_palette)
 
@@ -625,13 +642,25 @@ class ImageEditorApp(tk.Tk):
         f = tk.Frame(parent, bg=PANEL, width=300)
         f.pack(side=tk.RIGHT, fill=tk.Y)
         f.pack_propagate(False)
-        nb = ttk.Notebook(f)
+        # Rechte Seite 50/50 vertikal teilen (wie in Photoshop):
+        #   oben  → Infos/Korrekturen/SEO als Reiter
+        #   unten → das Ebenen-Panel, dauerhaft sichtbar
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(0, weight=1, uniform='rp')
+        f.rowconfigure(1, weight=1, uniform='rp')
+
+        top = tk.Frame(f, bg=PANEL)
+        top.grid(row=0, column=0, sticky='nsew')
+        nb = ttk.Notebook(top)
         nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self._right_nb = nb
         self._build_info_tab(nb)
-        self._build_layers_tab(nb)
         self._build_adjust_tab(nb)
         self._build_seo_tab(nb)
+
+        bottom = tk.Frame(f, bg=PANEL)
+        bottom.grid(row=1, column=0, sticky='nsew')
+        self._build_layers_panel(bottom)
 
     def _build_info_tab(self, nb):
         tab = tk.Frame(nb, bg=PANEL); nb.add(tab, text=' Info ')
@@ -649,9 +678,15 @@ class ImageEditorApp(tk.Tk):
             lbl2.grid(row=i, column=1, sticky='w', padx=4, pady=4)
             self._info_v[key] = lbl2
 
-    def _build_layers_tab(self, nb):
-        tab = tk.Frame(nb, bg=PANEL); nb.add(tab, text=' Ebenen ')
+    def _build_layers_panel(self, parent):
+        tab = tk.Frame(parent, bg=PANEL); tab.pack(fill=tk.BOTH, expand=True)
         self._layers_tab = tab
+
+        # Eigener Titel, da das Panel kein Reiter mehr ist
+        hdr = tk.Frame(tab, bg=PANEL); hdr.pack(fill=tk.X, padx=6, pady=(6, 0))
+        tk.Label(hdr, text='Ebenen', bg=PANEL, fg=TEXT,
+                 font=('Segoe UI', 9, 'bold'), anchor='w').pack(side=tk.LEFT)
+        tk.Frame(tab, bg=BORDER, height=1).pack(fill=tk.X, padx=6, pady=(4, 0))
 
         # Blend-Modus + Deckkraft
         ctrl = tk.Frame(tab, bg=PANEL); ctrl.pack(fill=tk.X, padx=6, pady=4)
@@ -730,6 +765,7 @@ class ImageEditorApp(tk.Tk):
 
     def _build_seo_tab(self, nb):
         tab = tk.Frame(nb, bg=PANEL); nb.add(tab, text=' SEO ')
+        self._seo_tab = tab
         outer = tk.Canvas(tab, bg=PANEL, highlightthickness=0)
         vsb   = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=outer.yview)
         outer.configure(yscrollcommand=vsb.set)
@@ -884,6 +920,10 @@ class ImageEditorApp(tk.Tk):
         self._comp_cache = comp
         c    = self._canvas
         c.delete('img'); c.delete('sel'); c.delete('welcome')
+        # Mal-Patches verwerfen – das frische Vollbild enthält bereits alle Striche
+        c.delete('paintpatch')
+        self._patch_imgs.clear()
+        self._stroke_dirty = None
 
         z      = self.zoom
         ox, oy = self.offset_x, self.offset_y
@@ -1011,7 +1051,9 @@ class ImageEditorApp(tk.Tk):
         tool = self.tool.get()
         if tool in ('brush', 'eraser') and self._drawing and self._last_xy:
             self._painting = True
-            self._paint_line(*self._last_xy, ix, iy, tool)
+            x0, y0 = self._last_xy
+            self._paint_line(x0, y0, ix, iy, tool)
+            self._accumulate_dirty(x0, y0, ix, iy)
             self._last_xy = (ix, iy)
             # Strich ist gezeichnet – Anzeige nur gedrosselt aktualisieren,
             # damit sich bei schneller Bewegung keine Renders stauen (kein Ruckeln).
@@ -1035,7 +1077,77 @@ class ImageEditorApp(tk.Tk):
 
     def _do_paint_render(self):
         self._paint_render_pending = False
-        self._render()
+        # Nur den bemalten Bereich nachziehen (billig). Geht das nicht
+        # (Mehrebenen, Fehler, zu viele Patches) → sicherer voller Render.
+        if not self._blit_dirty_patch():
+            self._render()
+
+    def _accumulate_dirty(self, x0, y0, x1, y1):
+        """Bemalten Bereich dieses Segments zum Dirty-Rechteck dazurechnen (Bildkoord.)."""
+        r = max(1, self.brush_size.get() // 2) + 2   # +2 px Rand gegen Skalierungs-Nähte
+        nx0, ny0 = min(x0, x1) - r, min(y0, y1) - r
+        nx1, ny1 = max(x0, x1) + r, max(y0, y1) + r
+        if self._stroke_dirty is None:
+            self._stroke_dirty = (nx0, ny0, nx1, ny1)
+        else:
+            ox0, oy0, ox1, oy1 = self._stroke_dirty
+            self._stroke_dirty = (min(ox0, nx0), min(oy0, ny0),
+                                  max(ox1, nx1), max(oy1, ny1))
+
+    def _direct_comp(self):
+        """Composite-Bild, falls genau EINE normale, deckende Ebene in Leinwandgröße
+        gezeigt wird – dann ist das Ebenenbild selbst das Composite (Voraussetzung
+        fürs schnelle Patch-Rendern). Sonst None → voller Render nötig."""
+        vis = [l for l in self.layers if l.visible]
+        if (len(vis) == 1 and vis[0].opacity == 100
+                and vis[0].blend_mode == 'Normal'
+                and vis[0].image.size == (self.canvas_w, self.canvas_h)):
+            return vis[0].image
+        return None
+
+    def _blit_dirty_patch(self) -> bool:
+        """Zeichnet nur das seit dem letzten Frame bemalte Rechteck als kleines
+        Bild über die Leinwand (statt den ganzen Viewport neu aufzubauen).
+        Tk repaintet dabei nur diese kleine Fläche → kein Ruckeln.
+        Liefert False, wenn ein voller Render nötig/sicherer ist."""
+        bb = self._stroke_dirty
+        if bb is None:
+            return True                      # nichts Neues zu zeigen
+        comp = self._direct_comp()
+        if comp is None:
+            return False                     # Mehrebenen → voller Render
+        # Patches nicht unbegrenzt anhäufen: ab und zu flach rendern.
+        if len(self._patch_imgs) >= 48:
+            return False
+        self._stroke_dirty = None
+        try:
+            c = self._canvas
+            z = self.zoom
+            ox, oy = self.offset_x, self.offset_y
+            bx0 = max(0, int(math.floor(bb[0])))
+            by0 = max(0, int(math.floor(bb[1])))
+            bx1 = min(self.canvas_w, int(math.ceil(bb[2])))
+            by1 = min(self.canvas_h, int(math.ceil(bb[3])))
+            if bx1 <= bx0 or by1 <= by0:
+                return True
+            crop = comp.crop((bx0, by0, bx1, by1))
+            dw = max(1, int(round((bx1 - bx0) * z)))
+            dh = max(1, int(round((by1 - by0) * z)))
+            disp = crop.resize((dw, dh), Image.NEAREST)
+            cs   = max(8, min(20, int(12 * min(z, 1.5))))
+            checker = self._make_checker(dw, dh, cs)   # frisch, ohne den Cache zu stören
+            if disp.mode == 'RGBA':
+                checker.paste(disp, mask=disp.split()[3])
+            else:
+                checker.paste(disp)
+            ph = ImageTk.PhotoImage(checker)
+            self._patch_imgs.append(ph)
+            c.create_image(ox + bx0 * z, oy + by0 * z, anchor='nw',
+                           image=ph, tags='paintpatch')
+            c.tag_raise('cursor_ring')        # Pinsel-Ring bleibt oben
+            return True
+        except Exception:
+            return False                     # bei jedem Fehler → voller Render
 
     def _on_up(self, ev):
         was_painting = self._painting
@@ -1102,10 +1214,24 @@ class ImageEditorApp(tk.Tk):
         self.offset_y = cy - iy * new
         self.zoom = new
         self._zoom_lbl.config(text=f'{self.zoom * 100:.0f} %')
+        self._last_mouse = (sx, sy)
         self._fast_render = True
+        # Mehrere Mausrad-Ticks zu EINEM Render bündeln (die Rechnung oben ist
+        # billig; nur der teure Neuaufbau wird gebündelt) → kein Stau beim schnellen Scrollen.
+        self._request_zoom_render()
+
+    def _request_zoom_render(self):
+        if self._zoom_render_pending:
+            return
+        self._zoom_render_pending = True
+        self.after_idle(self._do_zoom_render)
+
+    def _do_zoom_render(self):
+        self._zoom_render_pending = False
         self._render()
+        if self._last_mouse is not None:
+            self._draw_cursor_ring(*self._last_mouse)
         self._schedule_quality_render()
-        self._draw_cursor_ring(sx, sy)
 
     def _on_pan_start(self, ev):
         self._pan_data = (ev.x, ev.y, self.offset_x, self.offset_y)
@@ -1116,8 +1242,19 @@ class ImageEditorApp(tk.Tk):
             self.offset_x = ox + (ev.x - sx)
             self.offset_y = oy + (ev.y - sy)
             self._fast_render = True
-            self._render()
-            self._schedule_quality_render()
+            # Pan-Bewegungen bündeln, damit sich bei schnellem Ziehen keine Renders stauen.
+            self._request_pan_render()
+
+    def _request_pan_render(self):
+        if self._pan_render_pending:
+            return
+        self._pan_render_pending = True
+        self.after_idle(self._do_pan_render)
+
+    def _do_pan_render(self):
+        self._pan_render_pending = False
+        self._render()
+        self._schedule_quality_render()
 
     def _on_canvas_cfg(self, ev):
         if self.layers and self._fit_once:
@@ -1955,6 +2092,100 @@ class ImageEditorApp(tk.Tk):
         ColorPaletteDialog(self, colors, self._set_fg)
         self.set_status(f'{len(colors)} Farben extrahiert')
 
+    # ── Ton-Effekte ───────────────────────────────────────────────────────────
+
+    def cmd_sepia(self):
+        if self.image is None: return
+        self._push_undo()
+        self.image = fx.apply_sepia(self.image)
+        self._render(); self.set_status('Sepia angewendet')
+
+    def cmd_posterize(self):
+        if self.image is None: return
+        bits = simpledialog.askinteger('Posterisieren',
+            'Farbstufen pro Kanal (1–8 Bit, weniger = plakativer):',
+            initialvalue=3, minvalue=1, maxvalue=8, parent=self)
+        if bits:
+            self._push_undo()
+            self.image = fx.apply_posterize(self.image, bits)
+            self._render(); self.set_status(f'Posterisiert ({bits} Bit)')
+
+    def cmd_threshold(self):
+        if self.image is None: return
+        lvl = simpledialog.askinteger('Schwellenwert',
+            'Schwelle (0–255): heller = mehr Weiß',
+            initialvalue=128, minvalue=0, maxvalue=255, parent=self)
+        if lvl is not None:
+            self._push_undo()
+            self.image = fx.apply_threshold(self.image, lvl)
+            self._render(); self.set_status(f'Schwellenwert {lvl}')
+
+    def cmd_hue_shift(self):
+        if self.image is None: return
+        deg = simpledialog.askinteger('Farbton verschieben',
+            'Farbton-Drehung (0–360°):',
+            initialvalue=180, minvalue=0, maxvalue=360, parent=self)
+        if deg is not None:
+            self._push_undo()
+            self.image = fx.apply_hue_shift(self.image, deg)
+            self._render(); self.set_status(f'Farbton +{deg}°')
+
+    # ── Verpixeln / Bewegungsunschärfe ──────────────────────────────────────────
+
+    def cmd_pixelate(self):
+        if self.image is None: return
+        block = simpledialog.askinteger('Verpixeln / Mosaik',
+            'Blockgröße in Pixel (größer = gröber):',
+            initialvalue=12, minvalue=2, maxvalue=200, parent=self)
+        if block:
+            self._push_undo()
+            self.image = fx.apply_pixelate(self.image, block)
+            self._render(); self.set_status(f'Verpixelt (Block {block} px)')
+
+    def cmd_motion_blur(self):
+        if self.image is None: return
+        dist = simpledialog.askinteger('Bewegungsunschärfe',
+            'Stärke / Distanz in Pixel:',
+            initialvalue=15, minvalue=1, maxvalue=100, parent=self)
+        if dist:
+            ang = simpledialog.askinteger('Bewegungsunschärfe',
+                'Richtung (Winkel 0–360°, 0 = horizontal):',
+                initialvalue=0, minvalue=0, maxvalue=360, parent=self)
+            self._push_undo()
+            self.image = fx.apply_motion_blur(self.image, dist, ang or 0)
+            self._render(); self.set_status('Bewegungsunschärfe angewendet')
+
+    # ── Stilisieren ─────────────────────────────────────────────────────────────
+
+    def cmd_emboss(self):
+        if self.image is None: return
+        self._push_undo()
+        self.image = fx.apply_emboss(self.image)
+        self._render(); self.set_status('Emboss (Relief)')
+
+    def cmd_find_edges(self):
+        if self.image is None: return
+        self._push_undo()
+        self.image = fx.apply_find_edges(self.image)
+        self._render(); self.set_status('Kanten gefunden')
+
+    def cmd_sketch(self):
+        if self.image is None: return
+        self._push_undo()
+        self.image = fx.apply_sketch(self.image)
+        self._render(); self.set_status('Bleistift-Skizze')
+
+    def cmd_oil_paint(self):
+        if self.image is None: return
+        size = simpledialog.askinteger('Ölgemälde',
+            'Pinselgröße (3–15, größer = gröber):',
+            initialvalue=5, minvalue=3, maxvalue=15, parent=self)
+        if size:
+            self.set_status('Ölgemälde wird berechnet …'); self.update_idletasks()
+            self._push_undo()
+            self.image = fx.apply_oil_paint(self.image, size)
+            self._render(); self.set_status('Ölgemälde-Look')
+
     # ══════════════════════════════════════════════════════════════════════════
     #  EBENEN-SYSTEM
     # ══════════════════════════════════════════════════════════════════════════
@@ -2077,7 +2308,7 @@ class ImageEditorApp(tk.Tk):
             real_idx = len(self.layers) - 1 - i
             active   = (real_idx == self.active_idx)
 
-            row_bg   = '#1a3a5c' if active else PANEL2
+            row_bg   = '#e0e7ff' if active else PANEL2   # helles Indigo (passt zum hellen Theme)
             row_fg   = ACCENT    if active else TEXT
             row      = tk.Frame(self._layer_list, bg=row_bg, cursor='hand2',
                                 highlightthickness=1 if active else 0,
@@ -2096,7 +2327,7 @@ class ImageEditorApp(tk.Tk):
             try:
                 thumb = layer.image.copy()
                 thumb.thumbnail((36, 30), Image.NEAREST)
-                bg_th = Image.new('RGBA', (36, 30), (40, 44, 60, 255))
+                bg_th = Image.new('RGBA', (36, 30), (236, 238, 242, 255))
                 bg_th.paste(thumb, mask=thumb.split()[3] if thumb.mode == 'RGBA' else None)
                 ph = ImageTk.PhotoImage(bg_th.convert('RGB'))
                 self._layer_thumbs.append(ph)
@@ -2125,7 +2356,7 @@ class ImageEditorApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _focus_seo(self):
-        self._right_nb.select(3)
+        self._right_nb.select(self._seo_tab)
 
     def _load_seo(self, img_path: Path):
         sc = img_path.with_suffix('.seo.json')
