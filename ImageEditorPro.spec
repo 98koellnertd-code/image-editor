@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('constants.py', '.'), ('layers.py', '.'), ('effects.py', '.'), ('dialogs.py', '.')]
+datas = [('constants.py', '.'), ('layers.py', '.'), ('effects.py', '.'), ('dialogs.py', '.'), ('icon.ico', '.')]
 binaries = []
 hiddenimports = ['PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont', 'PIL.ImageTk', 'PIL.ImageFilter', 'PIL.ImageEnhance', 'PIL.ImageOps', 'PIL.ImageChops', 'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.filedialog', 'tkinter.simpledialog', 'tkinter.colorchooser']
 tmp_ret = collect_all('PIL')
@@ -46,4 +46,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='icon.ico',
 )

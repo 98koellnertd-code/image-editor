@@ -111,6 +111,13 @@ def _load_cairosvg():
         return None
 
 
+def resource_path(rel: str) -> str:
+    """Pfad zu einer mitgelieferten Datei – funktioniert im Dev-Modus UND im
+    PyInstaller-onefile-Bundle (dort wird alles nach sys._MEIPASS entpackt)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  RUNDER BUTTON  (Tk kann Widgets nicht abrunden → auf Canvas selbst zeichnen)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -294,6 +301,7 @@ class ImageEditorApp(tk.Tk):
         self.geometry('1480x920')
         self.minsize(960, 600)
         self.configure(bg=BG)
+        self._apply_icon()
         self._ttk_style()
         self._build_menu()
         self._build_toolbar()
@@ -314,6 +322,89 @@ class ImageEditorApp(tk.Tk):
                 self.attributes('-zoomed', True)
             except Exception:
                 pass
+        # Taskleisten-Icon ERST NACH dem Maximieren setzen – der state('zoomed')-
+        # Wechsel setzt das Fenster-Icon sonst wieder zurück. Zur Sicherheit zweifach.
+        if sys.platform == 'win32':
+            self.after(250, self._apply_win_icon)
+            self.after(900, self._apply_win_icon)
+
+    def _apply_icon(self):
+        """Titelleisten-Icon über Tk (iconbitmap, bewusst NICHT iconphoto).
+        Das Taskleisten-Icon wird separat in _apply_win_icon nach dem Maximieren
+        gesetzt – Wichtigster Punkt: icon.ico muss überhaupt gefunden werden
+        (resource_path findet es auch im PyInstaller-Bundle)."""
+        ico = resource_path('icon.ico')
+        self._ico_path = ico if os.path.exists(ico) else None
+        if not self._ico_path:
+            return
+        try:
+            self.iconbitmap(default=self._ico_path)
+        except Exception:
+            try:
+                self.iconbitmap(self._ico_path)
+            except Exception:
+                pass
+
+    def _apply_win_icon(self):
+        """Taskleisten-/Alt-Tab-Icon robust per WinAPI: WM_SETICON + Klassen-Icon
+        (NICHT iconphoto). Idempotent – Icon-Handles werden einmal geladen/gecacht."""
+        if sys.platform != 'win32' or not getattr(self, '_ico_path', None):
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            # Eigene App-ID → Windows behandelt uns als eigenständige App
+            try:
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    'SiteForge.ImageEditorPro')
+            except Exception:
+                pass
+            # winfo_id() liefert das Tk-Kindfenster – das echte Top-Level ist der Parent
+            hwnd = self.winfo_id()
+            GetParent = ctypes.windll.user32.GetParent
+            GetParent.restype  = wintypes.HWND
+            GetParent.argtypes = [wintypes.HWND]
+            top = GetParent(hwnd) or hwnd
+
+            # Icons nur EINMAL laden und cachen (verhindert GDI-Handle-Leck bei Re-Aufruf)
+            if not getattr(self, '_ico_handles', None):
+                IMAGE_ICON      = 1
+                LR_LOADFROMFILE = 0x00000010
+                LR_DEFAULTSIZE  = 0x00000040
+                load = ctypes.windll.user32.LoadImageW
+                load.restype  = wintypes.HANDLE
+                load.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+                big   = load(None, self._ico_path, IMAGE_ICON, 0,  0,  LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                small = load(None, self._ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+                self._ico_handles = (big, small)
+            big, small = self._ico_handles
+
+            WM_SETICON = 0x0080
+            ICON_SMALL, ICON_BIG = 0, 1
+            # argtypes/restype zwingend setzen – sonst schneidet ctypes HWND/Handle
+            # auf 64-Bit-Windows auf 32 Bit ab und die Nachricht trifft ins Leere.
+            send = ctypes.windll.user32.SendMessageW
+            send.restype  = wintypes.LPARAM
+            send.argtypes = [wintypes.HWND, wintypes.UINT,
+                             wintypes.WPARAM, wintypes.LPARAM]
+            if big:
+                send(top, WM_SETICON, ICON_BIG,   big)
+            if small:
+                send(top, WM_SETICON, ICON_SMALL, small)
+
+            # Klassen-Icon setzen → bleibt dauerhaft an Taskleiste/Alt-Tab hängen
+            GCLP_HICON, GCLP_HICONSM = -14, -34
+            setcls = getattr(ctypes.windll.user32, 'SetClassLongPtrW',
+                             ctypes.windll.user32.SetClassLongW)
+            setcls.restype  = ctypes.c_void_p
+            setcls.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            if big:
+                setcls(top, GCLP_HICON,   big)
+            if small:
+                setcls(top, GCLP_HICONSM, small)
+        except Exception:
+            pass
 
     # ── TTK Style ─────────────────────────────────────────────────────────────
 
@@ -862,6 +953,7 @@ class ImageEditorApp(tk.Tk):
         c.bind('<Button-2>',        self._on_pan_start)
         c.bind('<B2-Motion>',       self._on_pan_drag)
         c.bind('<Configure>',       self._on_canvas_cfg)
+        c.bind('<Enter>',           self._on_enter)
         c.bind('<Leave>',           self._on_leave)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1193,6 +1285,12 @@ class ImageEditorApp(tk.Tk):
         """Ring an der letzten Mausposition neu zeichnen (z. B. nach Größenänderung)."""
         if self._last_mouse is not None:
             self._draw_cursor_ring(*self._last_mouse)
+
+    def _on_enter(self, ev):
+        """Maus betritt die Leinwand → Pinsel-Ring sofort zeigen (nicht erst
+        beim ersten Bewegen)."""
+        self._last_mouse = (ev.x, ev.y)
+        self._draw_cursor_ring(ev.x, ev.y)   # zeichnet nur bei Pinsel/Radierer
 
     def _on_leave(self, ev):
         self._last_mouse = None
@@ -2515,8 +2613,10 @@ class ImageEditorApp(tk.Tk):
                 self._canvas.configure(cursor=cur); break
             except Exception:
                 continue
-        self._canvas.delete('cursor_ring')
         self.set_status(f'Werkzeug: {self._TOOL_NAMES.get(name, name)}')
+        # Ring sofort an der aktuellen Mausposition zeigen (statt nur zu löschen);
+        # _draw_cursor_ring entfernt ihn automatisch bei Nicht-Pinsel-Werkzeugen.
+        self._refresh_cursor_ring()
 
     def _update_title(self):
         name = self.file_path.name if self.file_path else 'Unbenannt'

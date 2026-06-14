@@ -52,6 +52,7 @@ python -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name "ImageEditorPro" ^
+    --icon "icon.ico" ^
     --hidden-import "PIL" ^
     --hidden-import "PIL.Image" ^
     --hidden-import "PIL.ImageDraw" ^
@@ -74,6 +75,7 @@ python -m PyInstaller ^
     --add-data "layers.py;." ^
     --add-data "effects.py;." ^
     --add-data "dialogs.py;." ^
+    --add-data "icon.ico;." ^
     image_editor.py
 if errorlevel 1 (
     echo.
