@@ -25,10 +25,20 @@ if errorlevel 1 (
     echo  [INFO] rembg nicht gefunden. Wird installiert...
     pip install rembg -q
 )
-python -c "import cairosvg" >nul 2>&1
+python -c "import fitz" >nul 2>&1
 if errorlevel 1 (
-    echo  [INFO] cairosvg nicht gefunden. Wird installiert...
-    pip install cairosvg -q
+    echo  [INFO] PyMuPDF nicht gefunden. Wird installiert...
+    pip install pymupdf -q
+)
+python -c "import psd_tools" >nul 2>&1
+if errorlevel 1 (
+    echo  [INFO] psd-tools nicht gefunden. Wird installiert...
+    pip install psd-tools -q
+)
+python -c "import numpy, scipy" >nul 2>&1
+if errorlevel 1 (
+    echo  [INFO] numpy/scipy nicht gefunden. Wird installiert...
+    pip install numpy scipy -q
 )
 
 :: Laufende Instanz beenden (falls noch offen)
@@ -46,37 +56,10 @@ if exist "dist\ImageEditorPro.exe" (
     )
 )
 
-:: Kompilieren
+:: Kompilieren (ueber die .spec-Datei – dort werden ALLE optionalen Pakete
+:: – PyMuPDF, cairosvg, rembg, psd-tools, numpy, scipy – fest eingebacken)
 echo  [2/2] Kompiliere...
-python -m PyInstaller ^
-    --onefile ^
-    --windowed ^
-    --name "ImageEditorPro" ^
-    --icon "icon.ico" ^
-    --hidden-import "PIL" ^
-    --hidden-import "PIL.Image" ^
-    --hidden-import "PIL.ImageDraw" ^
-    --hidden-import "PIL.ImageFont" ^
-    --hidden-import "PIL.ImageTk" ^
-    --hidden-import "PIL.ImageFilter" ^
-    --hidden-import "PIL.ImageEnhance" ^
-    --hidden-import "PIL.ImageOps" ^
-    --hidden-import "PIL.ImageChops" ^
-    --hidden-import "tkinter" ^
-    --hidden-import "tkinter.ttk" ^
-    --hidden-import "tkinter.messagebox" ^
-    --hidden-import "tkinter.filedialog" ^
-    --hidden-import "tkinter.simpledialog" ^
-    --hidden-import "tkinter.colorchooser" ^
-    --collect-all "PIL" ^
-    --collect-all "rembg" ^
-    --collect-all "cairosvg" ^
-    --add-data "constants.py;." ^
-    --add-data "layers.py;." ^
-    --add-data "effects.py;." ^
-    --add-data "dialogs.py;." ^
-    --add-data "icon.ico;." ^
-    image_editor.py
+python -m PyInstaller --noconfirm "ImageEditorPro.spec"
 if errorlevel 1 (
     echo.
     echo  [FEHLER] Build fehlgeschlagen. Siehe Ausgabe oben.

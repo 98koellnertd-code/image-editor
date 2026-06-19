@@ -244,6 +244,10 @@ class ImageEditorApp(tk.Tk):
         self._sel_bbox:  tuple | None        = None
         self._sel_mask:  Image.Image | None  = None  # 'L'-Maske für Zauberstab
 
+        # ── Verschieben (Ebene) ──────────────────────────────────────────────
+        self._move_start: tuple | None = None  # (ix, iy, layer.ox, layer.oy) bei Drag-Start
+        self._resize_start: tuple | None = None  # (handle, ox0, oy0, w0, h0, orig_img) bei Skalieren
+
         # ── Zauberstab ────────────────────────────────────────────────────────
         self._wand_tol         = tk.IntVar(value=30)
         self._wand_contiguous  = tk.BooleanVar(value=True)
@@ -271,6 +275,20 @@ class ImageEditorApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
     #  image-Property (Kompatibilität: alle Ops arbeiten auf der aktiven Ebene)
     # ══════════════════════════════════════════════════════════════════════════
+
+    @property
+    def active_layer(self) -> 'Layer | None':
+        if not self.layers or self.active_idx >= len(self.layers):
+            return None
+        return self.layers[self.active_idx]
+
+    def _canvas2local(self, x, y):
+        """Canvas-Koordinaten → lokale Koordinaten der aktiven Ebene
+        (berücksichtigt deren Position ox/oy, falls sie nicht bei (0,0) liegt)."""
+        layer = self.active_layer
+        if layer is None:
+            return x, y
+        return x - layer.ox, y - layer.oy
 
     @property
     def image(self) -> Image.Image | None:
@@ -478,7 +496,7 @@ class ImageEditorApp(tk.Tk):
         em.add_command(label='Auswahl aufheben',    accelerator='Esc',     command=self.cmd_deselect)
         em.add_command(label='Auswahl löschen',     accelerator='Delete',  command=self.cmd_delete_selection)
         em.add_command(label='Auswahl umkehren',    accelerator='Ctrl+I',  command=self.cmd_invert_selection)
-        em.add_command(label='Auswahl zuschneiden',                        command=self.cmd_crop_selection)
+        em.add_command(label='Auswahl zuschneiden (aktive Ebene)',         command=self.cmd_crop_selection)
 
         bm = m(mb, 'Bild')
         bm.add_command(label='Größe ändern…',       command=self.cmd_resize)
@@ -497,6 +515,7 @@ class ImageEditorApp(tk.Tk):
         bm.add_command(label='Ecken abrunden…',         command=self.cmd_round_corners)
         bm.add_command(label='Hintergrund entfernen…',  command=self.cmd_remove_bg)
         bm.add_command(label='Alpha-Kante verfeinern…', command=self.cmd_refine_alpha)
+        bm.add_command(label='Kanten glätten…',          command=self.cmd_smooth_edges)
 
         adj = m(mb, 'Korrekturen')
         adj.add_command(label='Helligkeit / Kontrast…', command=self.dlg_brightness)
@@ -535,6 +554,8 @@ class ImageEditorApp(tk.Tk):
         em2.add_command(label='Neue Ebene',        accelerator='Ctrl+Shift+N', command=self.cmd_new_layer)
         em2.add_command(label='Ebene duplizieren', command=self.cmd_duplicate_layer)
         em2.add_command(label='Ebene löschen',     command=self.cmd_delete_layer)
+        em2.add_separator()
+        em2.add_command(label='Ebene skalieren…', command=self.cmd_resize_layer)
         em2.add_separator()
         em2.add_command(label='Nach oben',          command=self.cmd_layer_up)
         em2.add_command(label='Nach unten',         command=self.cmd_layer_down)
@@ -594,9 +615,10 @@ class ImageEditorApp(tk.Tk):
         btn('🔍–',              self.zoom_out,         'Auszoomen (Ctrl+-)')
         btn('⊞ Fit',           self.zoom_fit,         'An Fenster (Ctrl+0)')
         sep()
-        btn('✂ Crop',          self.cmd_crop_selection, 'Auswahl zuschneiden')
+        btn('✂ Crop',          self.cmd_crop_selection, 'Auswahl zuschneiden (aktive Ebene)')
         btn('↕ Größe',         self.cmd_resize,       'Größe ändern')
         btn('🪄 BG entfernen', self.cmd_remove_bg,    'Hintergrund entfernen (KI)')
+        btn('✨ Kanten',       self.cmd_smooth_edges, 'Kanten glätten (Freisteller-Antialiasing)')
         btn('⬛ Radius',       self.cmd_round_corners,'Ecken abrunden')
         sep()
         btn('🌫 Vignette',     self.dlg_vignette,     'Vignette hinzufügen')
@@ -619,7 +641,7 @@ class ImageEditorApp(tk.Tk):
                  font=('Segoe UI', 7, 'bold')).pack(anchor='w', padx=8, pady=(3, 2))
 
     def _build_tools_panel(self, parent):
-        f = tk.Frame(parent, bg=PANEL, width=132)
+        f = tk.Frame(parent, bg=PANEL, width=185)
         f.pack(side=tk.LEFT, fill=tk.Y)
         f.pack_propagate(False)
 
@@ -634,10 +656,11 @@ class ImageEditorApp(tk.Tk):
             ('eyedrop',    '🔬', 'Pipette'),
             ('text',       'T',   'Text'),
             ('crop',       '⊹',  'Zuschneiden'),
+            ('move',       '✥',  'Verschieben (aktive Ebene)'),
         ]
         LABELS = {'cursor': 'Auswahl', 'magic_wand': 'Zauber', 'brush': 'Pinsel',
                   'eraser': 'Radierer', 'fill': 'Füllen', 'eyedrop': 'Pipette',
-                  'text': 'Text', 'crop': 'Crop'}
+                  'text': 'Text', 'crop': 'Crop', 'move': 'Verschieben'}
         self._tool_btns: dict[str, RoundedButton] = {}
         for name, icon, tip in TOOLS:
             b = RoundedButton(f, text=f'{icon}   {LABELS.get(name, "")}', anchor='w',
@@ -683,21 +706,13 @@ class ImageEditorApp(tk.Tk):
         self._sec(f, 'PINSEL')
         for lbl, var in [('Größe', self.brush_size), ('Opazität', self.brush_opac)]:
             tk.Label(f, text=lbl, bg=PANEL, fg=TEXT_DIM, font=('Segoe UI', 7)).pack(pady=(4,0))
-            ttk.Scale(f, from_=1, to=(200 if lbl == 'Größe' else 100),
-                      variable=var, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=6, pady=1)
+            self._stepper_row(f, var, 1, (200 if lbl == 'Größe' else 100))
 
         # Zauberstab
         self._sec(f, 'ZAUBERSTAB')
         tk.Label(f, text='Toleranz', bg=PANEL, fg=TEXT_DIM, font=('Segoe UI', 7)).pack(pady=(4,0))
-        wand_row = tk.Frame(f, bg=PANEL); wand_row.pack(fill=tk.X, padx=6)
-        self._wand_lbl = tk.Label(wand_row, text='30', bg=PANEL, fg=ACCENT,
-                                   font=('Segoe UI', 8), width=3)
-        self._wand_lbl.pack(side=tk.RIGHT)
-        ttk.Scale(wand_row, from_=0, to=255, variable=self._wand_tol,
-                  orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._wand_tol.trace_add('write',
-            lambda *a: (_safe_lbl(self._wand_lbl, self._wand_tol, '{}'),
-                        self._wand_live_update()))
+        self._stepper_row(f, self._wand_tol, 0, 255)
+        self._wand_tol.trace_add('write', lambda *a: self._wand_live_update())
         ttk.Checkbutton(f, text='Zusammenhängend',
                         variable=self._wand_contiguous,
                         command=self._wand_live_update).pack(padx=6, anchor='w', pady=2)
@@ -706,6 +721,56 @@ class ImageEditorApp(tk.Tk):
                   bg=BTN, fg=TEXT, bd=0, padx=4, pady=3,
                   font=('Segoe UI', 7), relief=tk.FLAT, cursor='hand2'
                   ).pack(fill=tk.X, padx=6, pady=2)
+
+    def _stepper_row(self, parent, var, mn, mx):
+        """Schieber + Zahl-Eingabefeld + −/+ Schrittknöpfe für eine IntVar.
+
+        Erlaubt drei Bedienarten: Ziehen am Schieber, exakte Zahl ins Feld
+        tippen (Return/Verlassen übernimmt) oder schrittweise mit − / +.
+        """
+        row = tk.Frame(parent, bg=PANEL); row.pack(fill=tk.X, padx=6, pady=1)
+
+        def clamp(v):
+            try:
+                v = int(round(float(v)))
+            except (TypeError, ValueError):
+                return None
+            return max(mn, min(mx, v))
+
+        def step(d):
+            cur = clamp(var.get())
+            nv  = clamp((mn if cur is None else cur) + d)
+            if nv is not None:
+                var.set(nv)
+
+        def from_entry(_=None):
+            nv = clamp(ent_var.get())
+            if nv is not None:
+                var.set(nv)
+            ent_var.set(str(var.get()))          # Eingabe normalisieren
+
+        bcfg = dict(bg=BTN, fg=TEXT, bd=0, width=2, font=('Segoe UI', 9, 'bold'),
+                    relief=tk.FLAT, cursor='hand2', activebackground=BORDER)
+        tk.Button(row, text='−', command=lambda: step(-1), **bcfg).pack(side=tk.LEFT)
+        ttk.Scale(row, from_=mn, to=mx, variable=var,
+                  orient=tk.HORIZONTAL).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        tk.Button(row, text='+', command=lambda: step(1), **bcfg).pack(side=tk.LEFT)
+
+        ent_var = tk.StringVar(value=str(var.get()))
+        ent = tk.Entry(row, textvariable=ent_var, width=4, bg=PANEL2, fg=ACCENT,
+                       insertbackground=ACCENT, bd=1, relief='flat',
+                       font=('Consolas', 9), justify='center')
+        ent.pack(side=tk.LEFT, padx=(4, 0))
+        ent.bind('<Return>',   from_entry)
+        ent.bind('<FocusOut>', from_entry)
+
+        # Schieber-/Knopf-Änderungen ins Eingabefeld spiegeln (nur wenn nicht
+        # gerade dort getippt wird, sonst springt der Cursor)
+        def _mirror(*_):
+            if parent.focus_get() is not ent:
+                ent_var.set(str(var.get()))
+        var.trace_add('write', _mirror)
+        return row
 
     # ── Canvas-Bereich ─────────────────────────────────────────────────────────
 
@@ -949,7 +1014,16 @@ class ImageEditorApp(tk.Tk):
         c.bind('<B1-Motion>',       self._on_drag)
         c.bind('<ButtonRelease-1>', self._on_up)
         c.bind('<Motion>',          self._on_move)
-        c.bind('<MouseWheel>',      self._on_wheel)
+        c.bind('<MouseWheel>',         self._on_wheel)          # normal: vertikal scrollen
+        c.bind('<Control-MouseWheel>', self._on_wheel_zoom)     # Strg: zoomen
+        c.bind('<Alt-MouseWheel>',     self._on_wheel_hscroll)  # Alt: horizontal scrollen
+        # Linux: Mausrad kommt als Button-4/5 statt <MouseWheel>
+        c.bind('<Button-4>',           lambda e: self._on_wheel(e, 120))
+        c.bind('<Button-5>',           lambda e: self._on_wheel(e, -120))
+        c.bind('<Control-Button-4>',   lambda e: self._on_wheel_zoom(e, 120))
+        c.bind('<Control-Button-5>',   lambda e: self._on_wheel_zoom(e, -120))
+        c.bind('<Alt-Button-4>',       lambda e: self._on_wheel_hscroll(e, 120))
+        c.bind('<Alt-Button-5>',       lambda e: self._on_wheel_hscroll(e, -120))
         c.bind('<Button-2>',        self._on_pan_start)
         c.bind('<B2-Motion>',       self._on_pan_drag)
         c.bind('<Configure>',       self._on_canvas_cfg)
@@ -1000,7 +1074,8 @@ class ImageEditorApp(tk.Tk):
         vis = [l for l in self.layers if l.visible]
         single = (len(vis) == 1 and vis[0].opacity == 100
                   and vis[0].blend_mode == 'Normal'
-                  and vis[0].image.size == (self.canvas_w, self.canvas_h))
+                  and vis[0].image.size == (self.canvas_w, self.canvas_h)
+                  and vis[0].ox == 0 and vis[0].oy == 0)
         if single:
             comp = vis[0].image
         elif (self._fast_render and self._comp_cache is not None
@@ -1011,7 +1086,7 @@ class ImageEditorApp(tk.Tk):
             comp = composite(self.layers, self.canvas_w, self.canvas_h)
         self._comp_cache = comp
         c    = self._canvas
-        c.delete('img'); c.delete('sel'); c.delete('welcome')
+        c.delete('img'); c.delete('sel'); c.delete('welcome'); c.delete('movebox')
         # Mal-Patches verwerfen – das frische Vollbild enthält bereits alle Striche
         c.delete('paintpatch')
         self._patch_imgs.clear()
@@ -1072,6 +1147,21 @@ class ImageEditorApp(tk.Tk):
                 x1 * z + ox, y1 * z + oy, x2 * z + ox, y2 * z + oy,
                 outline=ACCENT, width=1, dash=(4, 3), tags='sel')
 
+        # Verschieben/Skalieren-Werkzeug: Rahmen + Eck-Griffe der aktiven Ebene
+        if self.tool.get() == 'move':
+            layer = self.active_layer
+            if layer is not None:
+                lox1, loy1 = layer.ox, layer.oy
+                lox2, loy2 = lox1 + layer.image.width, loy1 + layer.image.height
+                sx1, sy1 = lox1 * z + ox, loy1 * z + oy
+                sx2, sy2 = lox2 * z + ox, loy2 * z + oy
+                c.create_rectangle(sx1, sy1, sx2, sy2,
+                                    outline=ACCENT, width=1, dash=(4, 3), tags='movebox')
+                hs = 5  # Griffgröße (Bildschirm-Pixel)
+                for hx, hy in ((sx1, sy1), (sx2, sy1), (sx1, sy2), (sx2, sy2)):
+                    c.create_rectangle(hx-hs, hy-hs, hx+hs, hy+hs,
+                                        fill=ACCENT, outline=PANEL, width=1, tags='movebox')
+
         # Cursor-Ring zuletzt neu zeichnen, damit er beim Malen NICHT verdeckt wird
         if self._last_mouse is not None:
             self._draw_cursor_ring(*self._last_mouse)
@@ -1105,6 +1195,37 @@ class ImageEditorApp(tk.Tk):
         cy = self._canvas.canvasy(cy)
         return (cx - self.offset_x) / self.zoom, (cy - self.offset_y) / self.zoom
 
+    def _i2s(self, ix, iy):
+        """Bild-Koordinaten → Canvas-Koordinaten (Zoom/Pan, OHNE Scrollbar-Versatz –
+        passend zu den Koordinaten, die create_rectangle()/create_image() erwarten)."""
+        return ix * self.zoom + self.offset_x, iy * self.zoom + self.offset_y
+
+    def _move_handle_at(self, wx, wy):
+        """Liefert 'nw'/'ne'/'sw'/'se', wenn (wx, wy) (Widget-Koordinaten) auf einem
+        Skalier-Griff der aktiven Ebene liegt, sonst None."""
+        layer = self.active_layer
+        if layer is None:
+            return None
+        cx, cy = self._canvas.canvasx(wx), self._canvas.canvasy(wy)
+        lox1, loy1 = layer.ox, layer.oy
+        lox2, loy2 = lox1 + layer.image.width, loy1 + layer.image.height
+        sx1, sy1 = self._i2s(lox1, loy1)
+        sx2, sy2 = self._i2s(lox2, loy2)
+        tol = 8
+        for name, hx, hy in (('nw', sx1, sy1), ('ne', sx2, sy1),
+                              ('sw', sx1, sy2), ('se', sx2, sy2)):
+            if abs(cx - hx) <= tol and abs(cy - hy) <= tol:
+                return name
+        return None
+
+    def _point_in_active_layer_box(self, ix, iy):
+        """Prüft, ob Bild-Koordinaten (ix, iy) innerhalb der aktiven Ebene liegen."""
+        layer = self.active_layer
+        if layer is None:
+            return False
+        return (layer.ox <= ix < layer.ox + layer.image.width
+                and layer.oy <= iy < layer.oy + layer.image.height)
+
     # ══════════════════════════════════════════════════════════════════════════
     #  MAUS
     # ══════════════════════════════════════════════════════════════════════════
@@ -1134,6 +1255,23 @@ class ImageEditorApp(tk.Tk):
             self._magic_wand_select(int(ix), int(iy))
         elif tool == 'text':
             self._add_text(ix, iy)
+        elif tool == 'move':
+            layer = self.active_layer
+            if layer is None:
+                return
+            if layer.locked:
+                self.set_status('Ebene ist gesperrt – kann nicht verschoben werden')
+                return
+            handle = self._move_handle_at(ev.x, ev.y)
+            self._push_undo()
+            if handle is not None:
+                self._resize_start = (handle, layer.ox, layer.oy,
+                                       layer.image.width, layer.image.height,
+                                       layer.image)
+                self._move_start = None
+            else:
+                self._resize_start = None
+                self._move_start = (ix, iy, layer.ox, layer.oy)
 
     def _on_drag(self, ev):
         self._last_mouse = (ev.x, ev.y)
@@ -1155,6 +1293,40 @@ class ImageEditorApp(tk.Tk):
             self._sel_bbox = (min(sx, ix), min(sy, iy), max(sx, ix), max(sy, iy))
             self._sel_mask = None
             self._render()
+        elif tool == 'move' and self._resize_start:
+            handle, ox0, oy0, w0, h0, orig_img = self._resize_start
+            layer = self.active_layer
+            if layer is not None:
+                ix_r, iy_r = round(ix), round(iy)
+                if handle == 'nw':
+                    ax, ay = ox0 + w0, oy0 + h0
+                    nx1, ny1 = min(ix_r, ax - 1), min(iy_r, ay - 1)
+                    nw, nh = ax - nx1, ay - ny1
+                elif handle == 'ne':
+                    ax, ay = ox0, oy0 + h0
+                    nx1, ny1 = ax, min(iy_r, ay - 1)
+                    nw, nh = max(1, ix_r - ax), ay - ny1
+                elif handle == 'sw':
+                    ax, ay = ox0 + w0, oy0
+                    nx1, ny1 = min(ix_r, ax - 1), ay
+                    nw, nh = ax - nx1, max(1, iy_r - ay)
+                else:  # 'se'
+                    ax, ay = ox0, oy0
+                    nx1, ny1 = ax, ay
+                    nw, nh = max(1, ix_r - ax), max(1, iy_r - ay)
+                nw, nh = max(1, nw), max(1, nh)
+                layer.ox, layer.oy = nx1, ny1
+                layer.image = orig_img.resize((nw, nh), Image.NEAREST)
+                self._comp_cache = None
+                self._render()
+        elif tool == 'move' and self._move_start:
+            sx, sy, sox, soy = self._move_start
+            layer = self.active_layer
+            if layer is not None:
+                layer.ox = sox + round(ix - sx)
+                layer.oy = soy + round(iy - sy)
+                self._comp_cache = None
+                self._render()
 
     def _request_paint_render(self):
         """Render während eines Pinselstrichs zusammenfassen → max. ~1 pro 20 ms.
@@ -1193,7 +1365,8 @@ class ImageEditorApp(tk.Tk):
         vis = [l for l in self.layers if l.visible]
         if (len(vis) == 1 and vis[0].opacity == 100
                 and vis[0].blend_mode == 'Normal'
-                and vis[0].image.size == (self.canvas_w, self.canvas_h)):
+                and vis[0].image.size == (self.canvas_w, self.canvas_h)
+                and vis[0].ox == 0 and vis[0].oy == 0):
             return vis[0].image
         return None
 
@@ -1248,6 +1421,20 @@ class ImageEditorApp(tk.Tk):
         self._last_xy  = None
         if self.tool.get() == 'cursor':
             self._sel_start = None
+        if self.tool.get() == 'move':
+            if self._resize_start:
+                handle, ox0, oy0, w0, h0, orig_img = self._resize_start
+                layer = self.active_layer
+                if layer is not None and layer.image.size != orig_img.size:
+                    # Finaler hochwertiger Resize-Pass (während des Ziehens wurde
+                    # zur Performance mit NEAREST skaliert)
+                    layer.image = orig_img.resize(layer.image.size, Image.LANCZOS)
+                    self._comp_cache = None
+                    self._render()
+                    self.set_status(f'Ebene "{layer.name}" skaliert: '
+                                     f'{layer.image.width} × {layer.image.height} px')
+            self._resize_start = None
+            self._move_start = None
         if was_painting:
             # ausstehenden gedrosselten Render verwerfen, einmal scharf nachzeichnen
             self._paint_render_pending = False
@@ -1261,8 +1448,12 @@ class ImageEditorApp(tk.Tk):
         ix_i, iy_i = int(ix), int(iy)
         if 0 <= ix_i < self.canvas_w and 0 <= iy_i < self.canvas_h:
             try:
-                px = self.image.getpixel((ix_i, iy_i))
-                self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}    {px}')
+                lx, ly = self._canvas2local(ix_i, iy_i)
+                if 0 <= lx < self.image.width and 0 <= ly < self.image.height:
+                    px = self.image.getpixel((lx, ly))
+                    self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}    {px}')
+                else:
+                    self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}')
             except Exception:
                 self._pos_lbl.config(text=f'X:{ix_i}  Y:{iy_i}')
         self._draw_cursor_ring(ev.x, ev.y)
@@ -1296,8 +1487,30 @@ class ImageEditorApp(tk.Tk):
         self._last_mouse = None
         self._canvas.delete('cursor_ring')
 
-    def _on_wheel(self, ev):
-        self._zoom_at(ev.x, ev.y, 1.15 if ev.delta > 0 else 1 / 1.15)
+    # Mausrad – Schrittweite pro „Rasterung" (delta ist auf Windows ein Vielfaches von 120)
+    _WHEEL_STEP = 80          # Pixel pro Rad-Tick beim Scrollen
+
+    def _on_wheel(self, ev, delta=None):
+        """Normales Scrollen → Bild hoch/runter."""
+        d = ev.delta if delta is None else delta
+        self._pan_by(0, (d / 120) * self._WHEEL_STEP)
+
+    def _on_wheel_hscroll(self, ev, delta=None):
+        """Alt + Scrollen → Bild nach links/rechts."""
+        d = ev.delta if delta is None else delta
+        self._pan_by((d / 120) * self._WHEEL_STEP, 0)
+
+    def _on_wheel_zoom(self, ev, delta=None):
+        """Strg + Scrollen → zum Mauszeiger ein-/auszoomen."""
+        d = ev.delta if delta is None else delta
+        self._zoom_at(ev.x, ev.y, 1.15 if d > 0 else 1 / 1.15)
+
+    def _pan_by(self, dx, dy):
+        """Bildausschnitt um (dx, dy) Canvas-Pixel verschieben. Rad hoch = Bild runter."""
+        self.offset_x += dx
+        self.offset_y += dy
+        self._fast_render = True
+        self._request_pan_render()
 
     def _zoom_at(self, sx, sy, factor):
         """Zoom zum Mauszeiger – der Punkt unter dem Cursor bleibt fix."""
@@ -1364,11 +1577,14 @@ class ImageEditorApp(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _paint_dot(self, x, y, tool):
+        x, y = self._canvas2local(x, y)
         r2 = max(1, self.brush_size.get() // 2)
         draw = ImageDraw.Draw(self.image)
         draw.ellipse([x-r2, y-r2, x+r2, y+r2], fill=self._tool_fill(tool))
 
     def _paint_line(self, x0, y0, x1, y1, tool):
+        x0, y0 = self._canvas2local(x0, y0)
+        x1, y1 = self._canvas2local(x1, y1)
         fill = self._tool_fill(tool)
         r2   = max(1, self.brush_size.get() // 2)
         draw = ImageDraw.Draw(self.image)
@@ -1389,32 +1605,74 @@ class ImageEditorApp(tk.Tk):
     def _flood_fill(self, x, y):
         if self.image is None:
             return
-        if not (0 <= x < self.canvas_w and 0 <= y < self.canvas_h):
+        lx, ly = self._canvas2local(x, y)
+        if not (0 <= lx < self.image.width and 0 <= ly < self.image.height):
+            self.set_status('Außerhalb der Ebene')
             return
+        import numpy as np
         r, g, b = self._hex2rgb(self.fg_color)
-        fill = (r, g, b, 255) if self.image.mode == 'RGBA' else (r, g, b)
+        rgba = self.image.mode == 'RGBA'
+        fill = (r, g, b, 255) if rgba else (r, g, b)
         try:
-            ImageDraw.floodfill(self.image, (x, y), fill, thresh=25)
+            tol = self._wand_tol.get()
+            # Gleiche Vergleichslogik wie der Zauberstab → Transparenz wird korrekt
+            # als Grenze erkannt (premultipliziertes Alpha), Toleranz-Regler greift.
+            cmp_arr = self._wand_compare_arr(self.image)       # (h, w, C)
+            target  = cmp_arr[ly, lx].astype(np.int16)
+            match   = np.abs(cmp_arr - target).max(axis=2) <= tol
+            region  = self._flood_bool(match, lx, ly)          # zusammenhängend ab Klick
+            px   = np.array(self.image)                        # (h, w, C)
+            px[region] = fill
+            self.image = Image.fromarray(px, self.image.mode)
+            n = int(region.sum())
+            self.set_status(f'Füllen: {n:,} Pixel  (Toleranz {tol})')
         except Exception as e:
             self.set_status(f'Füllen: {e}')
         self._render()
 
+    @staticmethod
+    def _wand_compare_arr(img):
+        """Array für den Farbvergleich (Zauberstab & Füllen).
+
+        RGBA → premultipliziertes RGB + Alpha als 4. Kanal: voll-transparente Pixel
+        werden dadurch alle zu (0,0,0,0) und vergleichen sich gleich, unabhängig vom
+        RGB-„Müll" unter der Transparenz. Sonstige Modi → reines RGB.
+        """
+        import numpy as np
+        if img.mode == 'RGBA':
+            a   = np.asarray(img, dtype=np.int16)              # (h, w, 4)
+            rgb = a[..., :3]
+            alpha = a[..., 3:4]                                # (h, w, 1)
+            premult = (rgb * alpha) // 255                     # transparent → (0,0,0)
+            return np.concatenate([premult, alpha], axis=2)    # (h, w, 4)
+        return np.asarray(img.convert('RGB'), dtype=np.int16)  # (h, w, 3)
+
     def _magic_wand_select(self, x: int, y: int):
-        """Pixel mit ähnlicher Farbe auswählen (BFS bei zusammenhängend, sonst global)."""
+        """Pixel mit ähnlicher Farbe auswählen (BFS bei zusammenhängend, sonst global).
+        x, y sind Canvas-Koordinaten; die Auswahl wird auf der aktiven Ebene berechnet
+        und danach an deren Position (ox/oy) in eine canvas-große Maske eingebettet."""
         if self.image is None:
             return
-        if not (0 <= x < self.canvas_w and 0 <= y < self.canvas_h):
+        layer = self.active_layer
+        lx, ly = self._canvas2local(x, y)
+        if not (0 <= lx < self.image.width and 0 <= ly < self.image.height):
+            self.set_status('Außerhalb der Ebene')
             return
         import numpy as np
         img      = self.image
         tol      = self._wand_tol.get()
         contig   = self._wand_contiguous.get()
         w, h     = img.size
-        self._wand_last = (x, y)   # für Live-Aktualisierung beim Tolerieren
+        self._wand_last = (x, y)   # Canvas-Koordinaten, für Live-Aktualisierung beim Tolerieren
 
-        # RGB-Array (vektorisiert statt pixelweiser Python-Schleife → kein „Aufhängen")
-        arr = np.asarray(img.convert('RGB'), dtype=np.int16)   # (h, w, 3)
-        target = arr[y, x].astype(np.int16)
+        # Vergleichs-Array bauen. Wichtig: bei RGBA-Bildern MUSS der Alpha-Kanal
+        # mitgerechnet werden, sonst behalten wegradierte (transparente) Pixel ihre
+        # rohen RGB-Werte – z. B. (0,0,0) beim Radierer – und werden je nach Klickfarbe
+        # selbst bei hoher Toleranz fälschlich aus-/eingeschlossen.
+        # Premultipliziertes Alpha macht alle voll-transparenten Pixel identisch (0,0,0)
+        # und behandelt eine Transparenz-Kante sauber als Grenze.
+        arr = self._wand_compare_arr(img)                      # (h, w, C) int16
+        target = arr[ly, lx].astype(np.int16)
 
         # Max-Kanal-Differenz (Chebyshev): Regler 0–255 = „erlaubte Abweichung
         # pro Farbkanal" – das ist intuitiv und trifft Flächen sauberer als die
@@ -1427,14 +1685,18 @@ class ImageEditorApp(tk.Tk):
             try:
                 from scipy.ndimage import label
                 lbl, _ = label(match)                          # 4er-Nachbarschaft
-                sel = lbl == lbl[y, x]
+                sel = lbl == lbl[ly, lx]
             except Exception:
                 # Fallback ohne scipy: numpy-basiertes Flood-Fill über die bool-Maske
-                sel = self._flood_bool(match, x, y)
+                sel = self._flood_bool(match, lx, ly)
         else:
             sel = match
 
-        mask = Image.fromarray(np.where(sel, 255, 0).astype('uint8'), 'L')
+        local_mask = Image.fromarray(np.where(sel, 255, 0).astype('uint8'), 'L')
+        # Auf Canvas-Größe einbetten, damit _sel_mask wie gewohnt Canvas-Koordinaten hat
+        # (Render-Overlay und _effective_mask gehen davon aus).
+        mask = Image.new('L', (self.canvas_w, self.canvas_h), 0)
+        mask.paste(local_mask, (layer.ox, layer.oy))
         n = int(sel.sum())
 
         self._sel_mask = mask
@@ -1478,9 +1740,11 @@ class ImageEditorApp(tk.Tk):
     def _eyedrop(self, x, y):
         if self.image is None:
             return
-        if not (0 <= x < self.canvas_w and 0 <= y < self.canvas_h):
+        lx, ly = self._canvas2local(x, y)
+        if not (0 <= lx < self.image.width and 0 <= ly < self.image.height):
+            self.set_status('Außerhalb der Ebene')
             return
-        px = self.image.getpixel((x, y))
+        px = self.image.getpixel((lx, ly))
         r, g, b = (int(px[0]), int(px[1]), int(px[2])) if isinstance(px, tuple) else (int(px),)*3
         self._set_fg(f'#{r:02x}{g:02x}{b:02x}')
         self.set_status(f'Farbe aufgenommen: {self.fg_color}')
@@ -1490,6 +1754,7 @@ class ImageEditorApp(tk.Tk):
         if not text:
             return
         self._push_undo()
+        x, y = self._canvas2local(x, y)
         r, g, b = self._hex2rgb(self.fg_color)
         fill = (r, g, b, int(self.brush_opac.get()/100*255)) if self.image.mode == 'RGBA' else (r,g,b)
         size = max(12, self.brush_size.get() * 2)
@@ -1757,12 +2022,34 @@ class ImageEditorApp(tk.Tk):
                 img.convert('P', palette=Image.ADAPTIVE).save(path, 'GIF')
             elif ext == '.ppm':
                 img.convert('RGB').save(path, 'PPM')
+            elif ext == '.svg':
+                self._write_svg(path, img)
             else:
                 img.save(path)
             self._save_seo(path)
             self.set_status(f'Gespeichert: {path.name}')
         except Exception as e:
             messagebox.showerror('Speicherfehler', str(e))
+
+    def _write_svg(self, path: Path, img: Image.Image):
+        """SVG speichern. Da dies ein Raster-Editor ist, wird das fertige Bild
+        verlustfrei als PNG in einen SVG-Container eingebettet (base64). Das
+        Ergebnis ist eine gueltige .svg, die ueberall oeffnet – ohne Zusatzpakete."""
+        import base64
+        buf = io.BytesIO()
+        img.save(buf, 'PNG', optimize=True)
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        w, h = img.size
+        svg = (
+            f'<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'xmlns:xlink="http://www.w3.org/1999/xlink" '
+            f'width="{w}" height="{h}" viewBox="0 0 {w} {h}">\n'
+            f'  <image width="{w}" height="{h}" '
+            f'xlink:href="data:image/png;base64,{b64}"/>\n'
+            f'</svg>\n'
+        )
+        path.write_text(svg, encoding='utf-8')
 
     def cmd_paste_clipboard(self):
         """Bild aus der Windows-Zwischenablage einfügen."""
@@ -1892,14 +2179,41 @@ class ImageEditorApp(tk.Tk):
         rs = {'Lanczos': Image.LANCZOS, 'Bicubic': Image.BICUBIC,
               'Bilinear': Image.BILINEAR, 'Nächster Pixel': Image.NEAREST
               }.get(method, Image.LANCZOS)
-        # Alle Ebenen mitskalieren (alle liegen auf voller Leinwandgröße)
+        # Alle Ebenen mitskalieren – Größe UND Position proportional anpassen,
+        # damit zugeschnittene/verschobene Ebenen relativ zueinander stimmen.
+        sx, sy = w / self.canvas_w, h / self.canvas_h
         for layer in self.layers:
-            layer.image = layer.image.resize((w, h), rs)
+            new_w = max(1, round(layer.image.width * sx))
+            new_h = max(1, round(layer.image.height * sy))
+            layer.image = layer.image.resize((new_w, new_h), rs)
+            layer.ox = round(layer.ox * sx)
+            layer.oy = round(layer.oy * sy)
         self.canvas_w, self.canvas_h = w, h
         self._sel_bbox = None; self._sel_mask = None; self._wand_last = None
         self._checker_key = None
         self.zoom_fit(); self._render()
         self.set_status(f'Bildgröße geändert: {w} × {h} px')
+
+    def cmd_resize_layer(self):
+        """Skaliert NUR die aktive Ebene – Canvas-Größe und alle anderen
+        Ebenen bleiben unverändert. Position (oben-links) bleibt fix."""
+        layer = self.active_layer
+        if layer is None:
+            self.set_status('Kein Bild geöffnet'); return
+        dlg = ResizeDialog(self, layer.image.size, title='Ebenengröße ändern')
+        if not dlg.result:
+            return
+        w, h, method = dlg.result
+        w, h = max(1, int(w)), max(1, int(h))
+        if (w, h) == layer.image.size:
+            self.set_status('Größe unverändert'); return
+        self._push_undo()
+        rs = {'Lanczos': Image.LANCZOS, 'Bicubic': Image.BICUBIC,
+              'Bilinear': Image.BILINEAR, 'Nächster Pixel': Image.NEAREST
+              }.get(method, Image.LANCZOS)
+        layer.image = layer.image.resize((w, h), rs)
+        self._render()
+        self.set_status(f'Ebene "{layer.name}" skaliert: {w} × {h} px')
 
     def cmd_canvas_size(self):
         if not self.layers: return
@@ -1911,25 +2225,46 @@ class ImageEditorApp(tk.Tk):
             ym = {'oben': 0,  'mitte': (nh-self.canvas_h)//2, 'unten':  nh-self.canvas_h}
             for layer in self.layers:
                 new_img = Image.new('RGBA', (nw, nh), fill)
-                new_img.paste(layer.image, (xm.get(ah,0), ym.get(av,0)))
+                # Bisherige Ebenen-Position (ox/oy) beim Einfügen berücksichtigen,
+                # dann auf das neue Canvas „backen" (Ebene wird wieder canvas-groß).
+                new_img.paste(layer.image, (xm.get(ah,0) + layer.ox, ym.get(av,0) + layer.oy))
                 layer.image = new_img
+                layer.ox = layer.oy = 0
             self.canvas_w, self.canvas_h = nw, nh
             self._checker_key = None
             self.zoom_fit(); self._render()
 
     def cmd_crop_selection(self):
-        if self.image is None or self._sel_bbox is None:
+        """Schneidet NUR die aktive Ebene auf die Auswahl zu – Canvas-Größe und
+        alle anderen Ebenen bleiben unverändert."""
+        if self.image is None:
+            self.set_status('Kein Bild geöffnet'); return
+        bbox = self._sel_bbox
+        if bbox is None and self._sel_mask is not None:
+            bbox = self._sel_mask.getbbox()
+        if bbox is None:
             self.set_status('Keine Auswahl – Auswahl-Werkzeug verwenden'); return
-        x1, y1, x2, y2 = self._sel_bbox
-        x1,y1 = max(0,int(x1)), max(0,int(y1))
-        x2,y2 = min(self.canvas_w,int(x2)), min(self.canvas_h,int(y2))
-        if x2 > x1 and y2 > y1:
-            self._push_undo()
-            for layer in self.layers:
-                layer.image = layer.image.crop((x1,y1,x2,y2))
-            self.canvas_w, self.canvas_h = x2-x1, y2-y1
-            self._sel_bbox = None
-            self.zoom_fit(); self._render()
+        x1, y1, x2, y2 = bbox
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(self.canvas_w, int(x2)), min(self.canvas_h, int(y2))
+
+        layer = self.active_layer
+        lx1, ly1 = layer.ox, layer.oy
+        lx2, ly2 = lx1 + layer.image.width, ly1 + layer.image.height
+        # Auswahl mit dem aktuellen Bereich der aktiven Ebene schneiden
+        # (Auswahl kann über die Ebene hinausragen).
+        nx1, ny1 = max(x1, lx1), max(y1, ly1)
+        nx2, ny2 = min(x2, lx2), min(y2, ly2)
+        if nx2 <= nx1 or ny2 <= ny1:
+            self.set_status('Auswahl liegt außerhalb der aktiven Ebene'); return
+
+        self._push_undo()
+        layer.image = layer.image.crop((nx1 - lx1, ny1 - ly1, nx2 - lx1, ny2 - ly1))
+        layer.ox, layer.oy = nx1, ny1
+        self._sel_bbox = None
+        self._sel_mask = None
+        self._render()
+        self.set_status(f'Ebene "{layer.name}" zugeschnitten: {nx2-nx1} × {ny2-ny1} px')
 
     def cmd_select_all(self):
         if self.layers:
@@ -1944,12 +2279,19 @@ class ImageEditorApp(tk.Tk):
         self._render()
 
     def cmd_delete_selection(self):
-        """Ausgewählte Pixel transparent machen."""
+        """Ausgewählte Pixel der AKTIVEN Ebene transparent machen – andere Ebenen
+        bleiben unberührt."""
         if self.image is None:
             return
-        mask = self._effective_mask()
-        if mask is None:
+        canvas_mask = self._effective_mask()
+        if canvas_mask is None:
             return
+        layer = self.active_layer
+        lx, ly = layer.ox, layer.oy
+        lw, lh = layer.image.size
+        # Canvas-Maske auf den lokalen Bereich der aktiven Ebene zuschneiden
+        # (PIL füllt Bereiche außerhalb der Quelle automatisch mit 0).
+        mask = canvas_mask.crop((lx, ly, lx + lw, ly + lh))
         self._push_undo()
         img = self.image.copy()
         r, g, b, a = img.split()
@@ -2062,6 +2404,17 @@ class ImageEditorApp(tk.Tk):
         self.image = _apply_alpha_threshold(self.image, alpha_thresh, post_blur)
         self._render()
         self.set_status('Alpha-Kante verfeinert')
+
+    def cmd_smooth_edges(self):
+        """Ausgefranste Freisteller-Kanten weich glätten (echtes Antialiasing)."""
+        if self.image is None: return
+        dlg = _SmoothEdgesDialog(self)
+        if dlg.result is None: return
+        strength, tighten = dlg.result
+        self._push_undo()
+        self.image = fx.apply_smooth_edges(self.image, strength, tighten)
+        self._render()
+        self.set_status('Kanten geglättet')
 
     # ══════════════════════════════════════════════════════════════════════════
     #  KORREKTUREN
@@ -2598,7 +2951,8 @@ class ImageEditorApp(tk.Tk):
 
     _TOOL_NAMES = {'cursor': 'Auswahl-Rechteck', 'magic_wand': 'Zauberstab',
                    'brush': 'Pinsel', 'eraser': 'Radierer', 'fill': 'Füllen',
-                   'eyedrop': 'Pipette', 'text': 'Text', 'crop': 'Zuschneiden'}
+                   'eyedrop': 'Pipette', 'text': 'Text', 'crop': 'Zuschneiden',
+                   'move': 'Verschieben'}
 
     def _select_tool(self, name: str):
         self.tool.set(name)
@@ -2607,7 +2961,7 @@ class ImageEditorApp(tk.Tk):
         # Cursor je Werkzeug – pro Name absichern (manche X11-Cursor fehlen unter Windows)
         CURSORS = {'cursor': 'arrow', 'magic_wand': 'target', 'brush': 'crosshair',
                    'eraser': 'crosshair', 'fill': 'dotbox', 'eyedrop': 'crosshair',
-                   'text': 'xterm', 'crop': 'sizing'}
+                   'text': 'xterm', 'crop': 'sizing', 'move': 'fleur'}
         for cur in (CURSORS.get(name, 'crosshair'), 'crosshair', 'arrow'):
             try:
                 self._canvas.configure(cursor=cur); break
@@ -2659,6 +3013,15 @@ class ImageEditorApp(tk.Tk):
         widget.bind('<Enter>', show, add='+'); widget.bind('<Leave>', hide, add='+')
 
     def cmd_install_deps(self):
+        # Im gebauten EXE sind alle Pakete bereits fest eingebacken – pip waere
+        # hier wirkungslos (sys.executable ist die EXE, nicht Python).
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(
+                'Pakete',
+                'Alle optionalen Funktionen (SVG, PSD, Zauberstab, KI-Freisteller)\n'
+                'sind in dieser Version bereits fest enthalten.\n'
+                'Es muss nichts nachinstalliert werden.')
+            return
         pkgs = ['rembg', 'pymupdf', 'psd-tools', 'numpy', 'scipy']
         if messagebox.askyesno('Pakete installieren',
                                'Optionale Funktionen aktivieren:\n\n'
@@ -2681,7 +3044,7 @@ class ImageEditorApp(tk.Tk):
         messagebox.showinfo('Image Editor Pro',
             'Image Editor Pro  v2.0\n\n'
             '✔ Ebenen-System mit 10 Blend-Modi\n'
-            '✔ PNG, JPG, WebP, BMP, TIFF, ICO, GIF, PSD*, SVG*, EPS*\n'
+            '✔ PNG, JPG, WebP, BMP, TIFF, ICO, GIF, PSD, SVG, EPS*\n'
             '✔ Hintergrund entfernen (rembg / KI)\n'
             '✔ Vignette, Wasserzeichen, Rahmen, Schlagschatten\n'
             '✔ Farb-Balance, Weißabgleich, Unscharf-Maske\n'
@@ -2844,6 +3207,61 @@ class _AlphaRefineDialog(tk.Toplevel):
 
     def _ok(self):
         self.result = (self._thresh.get(), self._blur.get())
+        self.destroy()
+
+
+class _SmoothEdgesDialog(tk.Toplevel):
+    """Kanten glätten – weiches Antialiasing der Freisteller-Kante."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = None
+        self.title('Kanten glätten')
+        self.configure(bg=PANEL)
+        self.resizable(False, False)
+        self.transient(parent)
+        self._strength = tk.IntVar(value=3)
+        self._tighten  = tk.IntVar(value=0)
+        self._build()
+        self.grab_set()
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, bg=PANEL, padx=20, pady=16); f.pack()
+        tk.Label(f, text='Kanten glätten', bg=PANEL, fg=TEXT,
+                 font=('Segoe UI', 10, 'bold')).pack(anchor='w', pady=(0, 4))
+        tk.Label(f, text='Glättet ausgefranste Freisteller-Kanten (Zauberstab /\n'
+                         'BG-Entfernen) mit echtem Antialiasing – die Kante bleibt\n'
+                         'weich statt wieder hart gerechnet zu werden.',
+                 bg=PANEL, fg=TEXT_DIM, font=('Segoe UI', 8),
+                 justify='left').pack(anchor='w', pady=(0, 8))
+
+        for label, var, mn, mx, tip in [
+            ('Stärke', self._strength, 1, 10,
+             '1–3 = leicht (Treppen weg)  |  5–10 = sehr weiche Kante'),
+            ('Kante zusammenziehen', self._tighten, -10, 10,
+             '0 = neutral  |  + entfernt Rest-Halos  |  − lässt Kante wachsen'),
+        ]:
+            tk.Label(f, text=label, bg=PANEL, fg=TEXT,
+                     font=('Segoe UI', 9, 'bold')).pack(anchor='w', pady=(8, 0))
+            tk.Label(f, text=tip, bg=PANEL, fg=TEXT_DIM,
+                     font=('Segoe UI', 7), justify='left').pack(anchor='w')
+            row = tk.Frame(f, bg=PANEL); row.pack(fill=tk.X, pady=2)
+            lbl = tk.Label(row, text=str(var.get()), bg=PANEL, fg=ACCENT,
+                           font=('Segoe UI', 9), width=4); lbl.pack(side=tk.RIGHT)
+            ttk.Scale(row, from_=mn, to=mx, variable=var,
+                      orient=tk.HORIZONTAL, length=260).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            var.trace_add('write', lambda *a, l=lbl, v=var: _safe_lbl(l, v, '{}'))
+
+        tk.Frame(f, bg=BORDER, height=1).pack(fill=tk.X, pady=10)
+        bf = tk.Frame(f, bg=PANEL); bf.pack(fill=tk.X)
+        tk.Button(bf, text='Abbrechen', command=self.destroy,
+                  bg=BTN, fg=TEXT, bd=0, padx=10, pady=4, relief=tk.FLAT).pack(side=tk.RIGHT, padx=4)
+        tk.Button(bf, text='✔  Anwenden', command=self._ok,
+                  bg=ACCENT, fg='#000', bd=0, padx=14, pady=4,
+                  relief=tk.FLAT, font=('Segoe UI', 9, 'bold')).pack(side=tk.RIGHT, padx=4)
+
+    def _ok(self):
+        self.result = (self._strength.get(), self._tighten.get())
         self.destroy()
 
 

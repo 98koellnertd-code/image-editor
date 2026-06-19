@@ -14,7 +14,8 @@ class Layer:
 
     def __init__(self, image: Image.Image, name: str | None = None,
                  visible: bool = True, opacity: int = 100,
-                 blend_mode: str = 'Normal', locked: bool = False):
+                 blend_mode: str = 'Normal', locked: bool = False,
+                 ox: int = 0, oy: int = 0):
         Layer._counter += 1
         self.image      = image.convert('RGBA')
         self.name       = name or f'Ebene {Layer._counter}'
@@ -22,6 +23,8 @@ class Layer:
         self.opacity    = opacity      # 0–100
         self.blend_mode = blend_mode
         self.locked     = locked
+        self.ox         = ox           # Position der Ebene auf dem Canvas (px)
+        self.oy         = oy
 
     def copy(self) -> 'Layer':
         obj = Layer.__new__(Layer)
@@ -31,6 +34,8 @@ class Layer:
         obj.opacity    = self.opacity
         obj.blend_mode = self.blend_mode
         obj.locked     = self.locked
+        obj.ox         = self.ox
+        obj.oy         = self.oy
         return obj
 
     def __repr__(self):
@@ -50,6 +55,12 @@ def composite(layers: list[Layer], canvas_w: int, canvas_h: int) -> Image.Image:
             r, g, b, a = top.split()
             a = a.point(lambda x: x * layer.opacity // 100)
             top = Image.merge('RGBA', (r, g, b, a))
+        # Ebene kann kleiner als das Canvas sein und/oder versetzt liegen
+        # (Crop/Resize/Verschieben einzelner Ebenen) – an ihre Position rücken.
+        if (layer.ox, layer.oy) != (0, 0) or top.size != (canvas_w, canvas_h):
+            positioned = Image.new('RGBA', (canvas_w, canvas_h), (0, 0, 0, 0))
+            positioned.paste(top, (layer.ox, layer.oy))  # clippt automatisch an den Rändern
+            top = positioned
         result = blend_layers(result, top, layer.blend_mode)
     return result
 

@@ -4,12 +4,21 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('constants.py', '.'), ('layers.py', '.'), ('effects.py', '.'), ('dialogs.py', '.'), ('icon.ico', '.')]
 binaries = []
 hiddenimports = ['PIL', 'PIL.Image', 'PIL.ImageDraw', 'PIL.ImageFont', 'PIL.ImageTk', 'PIL.ImageFilter', 'PIL.ImageEnhance', 'PIL.ImageOps', 'PIL.ImageChops', 'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.filedialog', 'tkinter.simpledialog', 'tkinter.colorchooser']
-tmp_ret = collect_all('PIL')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('rembg')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('cairosvg')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+# Alle optionalen Pakete fest ins exe einbacken, damit SVG/PSD/Zauberstab/KI
+# OHNE separate Installation funktionieren. Fehlende Pakete werden uebersprungen,
+# damit der Build nicht abbricht, wenn eins davon nicht installiert ist.
+# Hinweis: SVG laeuft ueber PyMuPDF (fitz). cairosvg/svglib/reportlab sind nur
+# optionale Fallbacks und unter Windows ohne native Cairo-DLL nicht nutzbar –
+# daher hier bewusst NICHT gelistet, um Build-Warnungen zu vermeiden.
+_optional = ['PIL', 'fitz', 'rembg',
+             'psd_tools', 'numpy', 'scipy']
+for _pkg in _optional:
+    try:
+        _d, _b, _h = collect_all(_pkg)
+        datas += _d; binaries += _b; hiddenimports += _h
+    except Exception as _e:
+        print(f'[spec] optionales Paket uebersprungen: {_pkg} ({_e})')
 
 
 a = Analysis(
@@ -46,5 +55,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico',
+    icon=['icon.ico'],
 )

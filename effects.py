@@ -128,6 +128,47 @@ def apply_drop_shadow(img: Image.Image, offset_x: int = 6, offset_y: int = 6,
     return result
 
 
+# ── Kanten glätten (Antialiasing für Freisteller) ────────────────────────────
+
+def apply_smooth_edges(img: Image.Image, strength: int = 3,
+                       tighten: int = 0) -> Image.Image:
+    """
+    Glättet harte/ausgefranste Freisteller-Kanten (z. B. nach Zauberstab oder
+    Hintergrund-Entfernen) mit echtem Antialiasing.
+
+    Im Gegensatz zu »Alpha-Kante verfeinern« wird die Kante NICHT wieder hart
+    gerechnet, sondern bleibt weich – die Treppen-Pixel verschwinden, der Umriss
+    bekommt einen sauberen, leicht weichen Übergang.
+
+    strength: Glättungsstärke (1–10) – größer = weichere Kante.
+    tighten:  Kante zusammenziehen (-10 … +10). Positiv entfernt Rest-Halos
+              (Kante schrumpft), negativ lässt die Kante leicht wachsen.
+    """
+    rgba = img.convert('RGBA')
+    r, g, b, a = rgba.split()
+
+    strength = max(1, min(10, int(strength)))
+    tighten  = max(-10, min(10, int(tighten)))
+
+    # 1. Medianfilter entfernt Treppen-/Einzelpixel direkt an der Kante
+    msize = 3 if strength <= 4 else 5
+    a = a.filter(ImageFilter.MedianFilter(size=msize))
+
+    # 2. Gaußscher Weichzeichner glättet den Alpha-Verlauf
+    a = a.filter(ImageFilter.GaussianBlur(radius=strength))
+
+    # 3. Sanfte lineare Übergangskurve um die Mitte: die 50 %-Grenze (= der
+    #    eigentliche Umriss) bleibt an Ort und Stelle, der Übergang wird aber
+    #    weich statt hart gerechnet → echtes Antialiasing.
+    center = 128 + tighten * 8          # tighten verschiebt die Schwelle
+    band   = max(8, strength * 10)      # Breite des weichen Übergangs
+    lo     = center - band
+    span   = max(1, 2 * band)
+    a = a.point(lambda x: max(0, min(255, int(round((x - lo) * 255 / span)))))
+
+    return Image.merge('RGBA', (r, g, b, a))
+
+
 # ── Farb-Palette extrahieren ──────────────────────────────────────────────────
 
 def extract_palette(img: Image.Image, count: int = 8) -> list[str]:

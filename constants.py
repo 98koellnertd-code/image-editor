@@ -36,7 +36,8 @@ OPEN_TYPES = [
 SAVE_TYPES = [
     ('PNG',  '*.png'), ('JPEG', '*.jpg'), ('WebP', '*.webp'),
     ('BMP',  '*.bmp'), ('TIFF', '*.tiff'), ('ICO', '*.ico'),
-    ('GIF',  '*.gif'), ('PPM',  '*.ppm'), ('Alle Dateien', '*.*'),
+    ('GIF',  '*.gif'), ('SVG',  '*.svg'), ('PPM',  '*.ppm'),
+    ('Alle Dateien', '*.*'),
 ]
 
 # ── Social-Media & Web-Presets ─────────────────────────────────────────────

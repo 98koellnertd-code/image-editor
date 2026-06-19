@@ -116,9 +116,9 @@ class NewImageDialog(_Base):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ResizeDialog(_Base):
-    def __init__(self, parent, current_size):
+    def __init__(self, parent, current_size, title='Bildgröße ändern'):
         self._ow, self._oh = current_size
-        super().__init__(parent, 'Bildgröße ändern')
+        super().__init__(parent, title)
 
     def _build(self):
         f = tk.Frame(self, bg=PANEL, padx=20, pady=14); f.pack()
